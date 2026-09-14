@@ -1,4 +1,5 @@
 import statistics
+import time
 from collections import defaultdict
 from datetime import datetime, timezone
 
@@ -73,11 +74,18 @@ def main():
             continue
         seen_connected_realm_ids.add(connected_realm_id)
 
+        t0 = time.monotonic()
         auctions = client.get_auctions_for_connected_realm(connected_realm_id).get("auctions", [])
+        print(f"  fetched {len(auctions)} listings in {time.monotonic() - t0:.2f}s", flush=True)
+
+        t0 = time.monotonic()
         aggregates = _aggregate_by_item(auctions)
         rows = _rows_from_aggregates(realm_slug, connected_realm_id, aggregates, fetched_at)
+        print(f"  aggregated to {len(rows)} items in {time.monotonic() - t0:.2f}s", flush=True)
+
+        t0 = time.monotonic()
         insert_item_snapshots(db, rows)
-        print(f"  {len(auctions)} listings -> {len(rows)} item aggregates written to DB", flush=True)
+        print(f"  wrote {len(rows)} rows to DB in {time.monotonic() - t0:.2f}s", flush=True)
 
     db.close()
 

@@ -19,6 +19,7 @@ jobs:
 
       - run: python -m core.main
         env:
+          PYTHONUNBUFFERED: "1"
           BNET_CLIENT_ID: ${{ secrets.BNET_CLIENT_ID }}
           BNET_CLIENT_SECRET: ${{ secrets.BNET_CLIENT_SECRET }}
           BNET_REGION: eu

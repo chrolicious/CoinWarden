@@ -1,3 +1,5 @@
+import time
+
 import libsql_client
 
 from core.config import Config
@@ -48,5 +50,9 @@ def insert_item_snapshots(client: libsql_client.Client, rows: list[tuple]) -> No
     """
     batch = [libsql_client.Statement(statement, row) for row in rows]
 
-    for i in range(0, len(batch), 500):
+    total_batches = (len(batch) + 499) // 500
+    for batch_num, i in enumerate(range(0, len(batch), 500), start=1):
+        t0 = time.monotonic()
         client.batch(batch[i : i + 500])
+        elapsed = time.monotonic() - t0
+        print(f"    batch {batch_num}/{total_batches} ({len(batch[i:i+500])} rows) in {elapsed:.2f}s", flush=True)
