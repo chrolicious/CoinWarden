@@ -1,3 +1,4 @@
+import re
 import time
 import requests
 
@@ -43,7 +44,9 @@ class BattleNetClient:
             f"/data/wow/realm/{realm_slug}",
             namespace=f"dynamic-{self.config.region}",
         )
-        return data["connected_realm"]["id"]
+        href = data["connected_realm"]["href"]
+        match = re.search(r"/connected-realm/(\d+)", href)
+        return int(match.group(1))
 
     def get_auctions_for_connected_realm(self, connected_realm_id: int) -> dict:
         """Non-commodity items (armor, weapons, mounts, pets, recipes) — connected-realm locked."""
