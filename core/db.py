@@ -3,24 +3,22 @@ import libsql_client
 from core.config import Config
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS auction_snapshots (
+CREATE TABLE IF NOT EXISTS item_price_snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     realm_slug TEXT NOT NULL,
     connected_realm_id INTEGER NOT NULL,
     item_id INTEGER NOT NULL,
-    auction_id INTEGER NOT NULL,
-    buyout INTEGER,
-    unit_price INTEGER,
-    quantity INTEGER NOT NULL,
-    time_left TEXT NOT NULL,
+    min_unit_price INTEGER NOT NULL,
+    median_unit_price INTEGER NOT NULL,
+    listing_count INTEGER NOT NULL,
+    total_quantity INTEGER NOT NULL,
     fetched_at TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_snapshots_item_realm_time
-    ON auction_snapshots (connected_realm_id, item_id, fetched_at);
+CREATE INDEX IF NOT EXISTS idx_item_snapshots_lookup
+    ON item_price_snapshots (connected_realm_id, item_id, fetched_at);
 
-CREATE INDEX IF NOT EXISTS idx_snapshots_auction
-    ON auction_snapshots (connected_realm_id, auction_id, fetched_at);
+DROP TABLE IF EXISTS auction_snapshots;
 """
 
 
@@ -39,14 +37,14 @@ def ensure_schema(client: libsql_client.Client) -> None:
             client.execute(statement)
 
 
-def insert_snapshots(client: libsql_client.Client, rows: list[tuple]) -> None:
+def insert_item_snapshots(client: libsql_client.Client, rows: list[tuple]) -> None:
     if not rows:
         return
 
     statement = """
-        INSERT INTO auction_snapshots
-            (realm_slug, connected_realm_id, item_id, auction_id, buyout, unit_price, quantity, time_left, fetched_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO item_price_snapshots
+            (realm_slug, connected_realm_id, item_id, min_unit_price, median_unit_price, listing_count, total_quantity, fetched_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     """
     batch = [libsql_client.Statement(statement, row) for row in rows]
 
