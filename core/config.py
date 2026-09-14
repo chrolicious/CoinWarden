@@ -13,3 +13,5 @@ class Config:
         for slug in os.environ["WOW_REALM_SLUGS"].split(",")
         if slug.strip()
     ]
+    turso_database_url = os.environ["TURSO_DATABASE_URL"]
+    turso_auth_token = os.environ["TURSO_AUTH_TOKEN"]
