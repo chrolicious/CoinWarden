@@ -9,15 +9,23 @@ from core.variants import bonus_ids
 
 AH_CUT = 0.05
 COPPER_PER_GOLD = 10_000
+SALES_WINDOW_DAYS = 7
+
+# Deposit risk (v2 addition): the gold lost if a relisted item expires unsold.
+# WoW's real deposit formula also applies a per-account reputation discount
+# (up to ~90% at max AH faction rep) that we have no way to know, so this is
+# deliberately the worst case (no discount) rather than a precise number -
+# it biases the ranking safely instead of ignoring the risk. Assumes you
+# always relist at the longest duration (48h) to maximise sell odds, which
+# is also the worst-case deposit rate.
+DEPOSIT_RATE_48H = 0.10
+SELL_HORIZON_DAYS = 2.0
 
 
 def _rows(conn: sqlite3.Connection, sql: str, params: list) -> list[dict]:
     cur = conn.execute(sql, params)
     cols = [c[0] for c in cur.description]
     return [dict(zip(cols, row)) for row in cur.fetchall()]
-
-
-SALES_WINDOW_DAYS = 7
 
 
 def ensure_latest_snapshot(conn: sqlite3.Connection) -> None:
@@ -46,12 +54,46 @@ def ensure_latest_snapshot(conn: sqlite3.Connection) -> None:
     """)
 
 
+# Shared tail: from a `priced` CTE carrying buy_price, net_profit (profit if
+# the sale happens, already computed from a *realized* sold price - never the
+# current ask), sold_7d, sell_listings (current supply on the sell side) and
+# vendor_sell_price, derive expected days-to-sell, P(sale within the relist
+# horizon), the worst-case deposit loss, and rank by expected value per day
+# of capital locked - not raw profit, so illiquid/expensive-to-relist items
+# stop floating to the top on a big-but-unlikely number.
+# Params: max_buy_copper, min_profit_copper, min_roi, max_roi, limit
+RISK_SCORE_SQL_TAIL = f"""
+scored AS (
+    SELECT *,
+           ROUND(MAX(1.0 * sell_listings * {SALES_WINDOW_DAYS} / sold_7d, 0.1), 1) AS days_to_sell,
+           ROUND(COALESCE(vendor_sell_price, 0) * {DEPOSIT_RATE_48H}, 0) AS deposit_estimate
+    FROM priced
+),
+final AS (
+    SELECT *,
+           ROUND(1 - EXP(-{SELL_HORIZON_DAYS} / days_to_sell), 3) AS p_sold_48h,
+           CAST((1 - EXP(-{SELL_HORIZON_DAYS} / days_to_sell)) * net_profit
+                - EXP(-{SELL_HORIZON_DAYS} / days_to_sell) * deposit_estimate AS INTEGER) AS expected_value
+    FROM scored
+)
+SELECT *, ROUND(1.0 * net_profit / buy_price, 2) AS roi,
+       ROUND(1.0 * expected_value / days_to_sell, 0) AS score_per_day
+FROM final
+WHERE buy_price <= ?
+  AND net_profit >= ?
+  AND 1.0 * net_profit / buy_price BETWEEN ? AND ?
+ORDER BY score_per_day DESC
+LIMIT ?
+"""
+
 # Cross-realm spread on the latest snapshot, per item variant. Buy at the
-# cheapest listing on the cheapest realm; sell by undercutting the cheapest
-# listing on the best other realm. The sell realm needs a minimum listing
-# count, and its price must sit within a sane multiple of the variant's
-# cross-realm anchor (lower-median of the cheapest listing per realm).
-# Params: min_sell_listings, sanity_multiple, max_buy_copper, min_profit_copper, min_roi, max_roi, limit
+# cheapest listing on the cheapest realm; sell on the other realm with the
+# best *actually realized* sold price (not the cheapest current ask - that's
+# a wish, not a transaction), gated on a minimum number of confirmed sales in
+# the last 7 days so zero-evidence variants never rank on a guess. The buy
+# price still needs to sit within a sane multiple of the cross-realm anchor
+# (median of the cheapest listing per realm) to filter obvious troll listings.
+# Params: min_sold_evidence, sanity_multiple, (RISK_SCORE_SQL_TAIL params)
 CROSS_REALM_SPREAD_SQL = f"""
 WITH latest AS (
     SELECT * FROM latest_snapshot
@@ -73,60 +115,58 @@ buy AS (
     FROM latest
 ),
 sell AS (
-    SELECT l.item_id, l.variant, l.realm_slug AS sell_realm, l.min_unit_price AS sell_price,
-           l.median_unit_price AS sell_median, l.listing_count AS sell_listings,
-           COALESCE(s.sold_7d, 0) AS sold_7d, s.sold_median_7d, COALESCE(s.relist_7d, 0) AS relist_7d,
-           ROW_NUMBER() OVER (PARTITION BY l.item_id, l.variant ORDER BY l.min_unit_price DESC) AS rn
+    SELECT l.item_id, l.variant, l.realm_slug AS sell_realm, l.min_unit_price AS current_ask,
+           l.listing_count AS sell_listings,
+           s.sold_7d, s.sold_median_7d, s.relist_7d,
+           ROW_NUMBER() OVER (PARTITION BY l.item_id, l.variant ORDER BY s.sold_median_7d DESC) AS rn
     FROM latest l
-    LEFT JOIN sales_7d s ON s.connected_realm_id = l.connected_realm_id AND s.item_id = l.item_id AND s.variant = l.variant
-    WHERE l.listing_count >= ?
+    JOIN sales_7d s ON s.connected_realm_id = l.connected_realm_id AND s.item_id = l.item_id AND s.variant = l.variant
+    WHERE s.sold_7d >= ?
 ),
 spread AS (
     SELECT b.item_id, b.variant, b.buy_realm, b.buy_price, b.buy_listings,
-           s.sell_realm, s.sell_price, s.sell_median, s.sell_listings,
-           s.sold_7d, s.sold_median_7d, s.relist_7d,
-           CASE WHEN s.sold_7d > 0 THEN ROUND(1.0 * s.sell_listings * {SALES_WINDOW_DAYS} / s.sold_7d, 1) END AS days_to_sell,
+           s.sell_realm, s.current_ask, s.sell_listings, s.sold_7d, s.sold_median_7d, s.relist_7d,
            a.anchor_price, a.realm_count,
-           CAST(s.sell_price * (1 - {AH_CUT}) - b.buy_price AS INTEGER) AS net_profit
+           CAST(s.sold_median_7d * (1 - {AH_CUT}) - b.buy_price AS INTEGER) AS net_profit
     FROM buy b
     JOIN anchor a ON a.item_id = b.item_id AND a.variant = b.variant
     JOIN sell s ON s.item_id = b.item_id AND s.variant = b.variant AND s.rn = 1
     WHERE b.rn = 1
       AND s.sell_realm != b.buy_realm
-      AND s.sell_price <= a.anchor_price * ?
-)
-SELECT sp.item_id, sp.variant, i.name, i.quality, i.item_class, i.item_subclass,
-       sp.buy_realm, sp.buy_price, sp.buy_listings,
-       sp.sell_realm, sp.sell_price, sp.sell_median, sp.sell_listings,
-       sp.sold_7d, sp.sold_median_7d, sp.relist_7d, sp.days_to_sell,
-       sp.anchor_price, sp.realm_count, sp.net_profit,
-       ROUND(1.0 * sp.net_profit / sp.buy_price, 2) AS roi
-FROM spread sp
-LEFT JOIN items i ON i.item_id = sp.item_id
-WHERE sp.buy_price <= ?
-  AND sp.net_profit >= ?
-  AND 1.0 * sp.net_profit / sp.buy_price BETWEEN ? AND ?
-ORDER BY sp.net_profit DESC
-LIMIT ?
+      AND s.sold_median_7d <= a.anchor_price * ?
+),
+priced AS (
+    SELECT sp.item_id, sp.variant, i.name, i.quality, i.item_class, i.item_subclass,
+           i.vendor_sell_price,
+           sp.buy_realm, sp.buy_price, sp.buy_listings,
+           sp.sell_realm, sp.current_ask, sp.sell_listings AS sell_listings,
+           sp.sold_7d AS sold_7d, sp.sold_median_7d, sp.relist_7d,
+           sp.anchor_price, sp.realm_count, sp.net_profit
+    FROM spread sp
+    LEFT JOIN items i ON i.item_id = sp.item_id
+),
+{RISK_SCORE_SQL_TAIL}
 """
 
 
-def cross_realm_spreads(conn, min_sell_listings: int, sanity_multiple: float, max_buy_gold: int,
+def cross_realm_spreads(conn, min_sold_evidence: int, sanity_multiple: float, max_buy_gold: int,
                         min_profit_gold: int, min_roi: float, max_roi: float, limit: int) -> list[dict]:
     ensure_latest_snapshot(conn)
     return _rows(conn, CROSS_REALM_SPREAD_SQL,
-                 [min_sell_listings, sanity_multiple, max_buy_gold * COPPER_PER_GOLD,
+                 [min_sold_evidence, sanity_multiple, max_buy_gold * COPPER_PER_GOLD,
                   min_profit_gold * COPPER_PER_GOLD, min_roi, max_roi, limit])
 
 
-# Timing flip on a single realm, per item variant: the current cheapest listing
-# vs the variant's own baseline. The baseline is the distribution of daily
-# typical prices (median of each day's cheapest listing) over the window;
-# while fewer than ? days exist it falls back to the hourly cheapest listings.
-# Turnover (hour-to-hour listing-count drops) is the liquidity gate and comes
-# from the hourly table plus the daily rollups.
+# Timing flip on a single realm, per item variant: current cheapest listing vs
+# the variant's own trailing baseline (daily typical prices once enough days
+# exist, hourly cheapest listings before that) - this is the dip-detection
+# signal (discount/zscore) and is unaffected by the sales work below, since a
+# deviation from the normal *ask* is exactly what "priced below normal" means.
+# The profit/ranking side is separate: it uses the realm's own realized sold
+# price in the last 7 days, gated the same way as spreads, so a "40% below
+# normal ask" item that nobody actually buys still won't rank highly.
 # Params: day_window_start, hourly_window_start, min_days, min_samples, min_turnover,
-#         min_discount, max_buy_copper, min_profit_copper, min_roi, max_roi, limit
+#         min_discount, min_sold_evidence, (RISK_SCORE_SQL_TAIL params)
 TIMING_FLIP_SQL = f"""
 WITH daily AS (
     SELECT connected_realm_id, item_id, variant, typical_price AS price, turnover_events
@@ -178,55 +218,53 @@ baseline AS (
 latest AS (
     SELECT * FROM latest_snapshot
 ),
-scored AS (
+dip AS (
     SELECT l.item_id, l.variant, l.realm_slug, l.min_unit_price AS buy_price, l.listing_count,
            b.p25, b.p50, b.p75, b.days, b.samples, b.source, b.turnover_events,
-           COALESCE(s.sold_7d, 0) AS sold_7d, s.sold_median_7d, COALESCE(s.relist_7d, 0) AS relist_7d,
-           CASE WHEN s.sold_7d > 0 THEN ROUND(1.0 * l.listing_count * {SALES_WINDOW_DAYS} / s.sold_7d, 1) END AS days_to_sell,
+           s.sold_7d, s.sold_median_7d, s.relist_7d,
            1.0 - 1.0 * l.min_unit_price / b.p50 AS discount,
-           CAST(b.p50 * (1 - {AH_CUT}) - l.min_unit_price AS INTEGER) AS net_profit,
            ROUND(1.0 * (b.p50 - l.min_unit_price) / MAX(b.p75 - b.p25, b.p50 * 0.05), 1) AS zscore
     FROM latest l
     JOIN baseline b ON b.connected_realm_id = l.connected_realm_id AND b.item_id = l.item_id AND b.variant = l.variant
-    LEFT JOIN sales_7d s ON s.connected_realm_id = l.connected_realm_id AND s.item_id = l.item_id AND s.variant = l.variant
+    JOIN sales_7d s ON s.connected_realm_id = l.connected_realm_id AND s.item_id = l.item_id AND s.variant = l.variant
     WHERE b.samples >= ?
       AND b.turnover_events >= ?
-)
-SELECT sc.item_id, sc.variant, i.name, sc.realm_slug, sc.buy_price, sc.listing_count,
-       sc.p25, sc.p50, sc.p75, sc.days, sc.samples, sc.source, sc.turnover_events,
-       sc.sold_7d, sc.sold_median_7d, sc.relist_7d, sc.days_to_sell,
-       ROUND(sc.discount, 2) AS discount, sc.net_profit,
-       ROUND(1.0 * sc.net_profit / sc.buy_price, 2) AS roi, sc.zscore
-FROM scored sc
-LEFT JOIN items i ON i.item_id = sc.item_id
-WHERE sc.discount >= ?
-  AND sc.buy_price <= ?
-  AND sc.net_profit >= ?
-  AND 1.0 * sc.net_profit / sc.buy_price BETWEEN ? AND ?
-ORDER BY sc.net_profit DESC
-LIMIT ?
+      AND s.sold_7d >= ?
+      AND 1.0 - 1.0 * l.min_unit_price / b.p50 >= ?
+),
+priced AS (
+    SELECT d.item_id, d.variant, i.name, i.quality, i.item_class, i.item_subclass, i.vendor_sell_price,
+           d.realm_slug, d.buy_price, d.listing_count AS sell_listings,
+           d.p25, d.p50, d.p75, d.days, d.samples, d.source, d.turnover_events,
+           d.sold_7d, d.sold_median_7d, d.relist_7d, d.discount, d.zscore,
+           CAST(d.sold_median_7d * (1 - {AH_CUT}) - d.buy_price AS INTEGER) AS net_profit
+    FROM dip d
+    LEFT JOIN items i ON i.item_id = d.item_id
+),
+{RISK_SCORE_SQL_TAIL}
 """
 
 
 def timing_flips(conn, window_days: int, min_days: int, min_samples: int, min_turnover: int,
-                 min_discount: float, max_buy_gold: int, min_profit_gold: int, min_roi: float,
-                 max_roi: float, limit: int) -> list[dict]:
+                 min_discount: float, min_sold_evidence: int, max_buy_gold: int, min_profit_gold: int,
+                 min_roi: float, max_roi: float, limit: int) -> list[dict]:
     now = datetime.now(timezone.utc)
     day_window_start = (now - timedelta(days=window_days)).strftime("%Y-%m-%d")
     hourly_window_start = (now - timedelta(days=window_days)).isoformat()
     ensure_latest_snapshot(conn)
     return _rows(conn, TIMING_FLIP_SQL,
                  [day_window_start, hourly_window_start, min_days, min_days, min_days, min_days,
-                  min_samples, min_turnover, min_discount, max_buy_gold * COPPER_PER_GOLD,
-                  min_profit_gold * COPPER_PER_GOLD, min_roi, max_roi, limit])
+                  min_samples, min_turnover, min_sold_evidence, min_discount,
+                  max_buy_gold * COPPER_PER_GOLD, min_profit_gold * COPPER_PER_GOLD, min_roi, max_roi, limit])
 
 
 # Published with permissive filters; the frontend applies the user's own
 # thresholds client-side so tightening them never requires a re-run.
-PUBLISH_SPREADS = dict(min_sell_listings=2, sanity_multiple=6.0, max_buy_gold=2_000_000,
+PUBLISH_SPREADS = dict(min_sold_evidence=2, sanity_multiple=6.0, max_buy_gold=2_000_000,
                        min_profit_gold=100, min_roi=0.1, max_roi=10.0, limit=5000)
 PUBLISH_TIMING = dict(window_days=30, min_days=5, min_samples=24, min_turnover=1, min_discount=0.15,
-                      max_buy_gold=2_000_000, min_profit_gold=100, min_roi=0.1, max_roi=10.0, limit=5000)
+                      min_sold_evidence=2, max_buy_gold=2_000_000, min_profit_gold=100, min_roi=0.1,
+                      max_roi=10.0, limit=5000)
 
 # Histories are published in shards (item_id % HISTORY_SHARDS) for every item
 # variant featured in the last FEATURED_RETENTION_DAYS, so an item that drops
@@ -320,6 +358,8 @@ def _add_risk_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--min-roi", type=float, default=0.2)
     parser.add_argument("--max-roi", type=float, default=4.0,
                         help="opportunities above this are treated as too good to be true")
+    parser.add_argument("--min-sold-evidence", type=int, default=1,
+                        help="minimum confirmed sales in the last 7 days")
     parser.add_argument("--limit", type=int, default=30)
 
 
@@ -329,23 +369,23 @@ def _label(r: dict) -> str:
 
 
 def _print_spreads(rows: list[dict]) -> None:
-    print(f"{'item':<46} {'buy':<24} {'sell':<24} {'sold7d':>6} {'d2sell':>6} {'net':>9} {'roi':>6}")
+    print(f"{'item':<46} {'buy':<24} {'sell realm':<24} {'sold7d':>6} {'d2sell':>6} "
+          f"{'p(sold)':>7} {'deposit':>8} {'net':>9} {'EV/day':>8}")
     for r in rows:
         buy = f"{r['buy_realm'][:10]} {_gold(r['buy_price'])} x{r['buy_listings']}"
-        sell = f"{r['sell_realm'][:10]} {_gold(r['sell_price'])} x{r['sell_listings']}"
-        d2s = f"{r['days_to_sell']:.0f}" if r["days_to_sell"] is not None else "-"
-        print(f"{_label(r):<46} {buy:<24} {sell:<24} {r['sold_7d']:>6} {d2s:>6} "
-              f"{_gold(r['net_profit']):>9} {r['roi']:>6.0%}")
+        sell = f"{r['sell_realm'][:10]} sold@{_gold(r['sold_median_7d'])} x{r['sold_7d']}"
+        print(f"{_label(r):<46} {buy:<24} {sell:<24} {r['sold_7d']:>6} {r['days_to_sell']:>6} "
+              f"{r['p_sold_48h']:>7.0%} {_gold(int(r['deposit_estimate'])):>8} "
+              f"{_gold(r['net_profit']):>9} {_gold(int(r['score_per_day'])):>8}")
 
 
 def _print_timing(rows: list[dict]) -> None:
-    print(f"{'item':<46} {'realm':<11} {'now':>9} {'p25':>9} {'p50':>9} {'p75':>9} "
-          f"{'base':>6} {'turn':>4} {'disc':>5} {'net':>9} {'roi':>5} {'z':>5}")
+    print(f"{'item':<46} {'realm':<11} {'now':>9} {'p50':>9} {'disc':>5} {'sold7d':>6} "
+          f"{'d2sell':>6} {'net':>9} {'EV/day':>8}")
     for r in rows:
-        base = f"{r['days']}d" if r["source"] == "daily" else f"{r['samples']}h"
-        print(f"{_label(r):<46} {r['realm_slug'][:10]:<11} {_gold(r['buy_price']):>9} {_gold(r['p25']):>9} "
-              f"{_gold(r['p50']):>9} {_gold(r['p75']):>9} {base:>6} {r['turnover_events']:>4} "
-              f"{r['discount']:>5.0%} {_gold(r['net_profit']):>9} {r['roi']:>5.0%} {r['zscore']:>5}")
+        print(f"{_label(r):<46} {r['realm_slug'][:10]:<11} {_gold(r['buy_price']):>9} {_gold(r['p50']):>9} "
+              f"{r['discount']:>5.0%} {r['sold_7d']:>6} {r['days_to_sell']:>6} "
+              f"{_gold(r['net_profit']):>9} {_gold(int(r['score_per_day'])):>8}")
 
 
 def main():
@@ -353,9 +393,8 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
 
     sp = sub.add_parser("spreads", help="cross-realm spread opportunities from the latest snapshot")
-    sp.add_argument("--min-sell-listings", type=int, default=3)
     sp.add_argument("--sanity-multiple", type=float, default=4.0,
-                    help="max sell price as a multiple of the cross-realm anchor price")
+                    help="max realized sell price as a multiple of the cross-realm anchor price")
     _add_risk_args(sp)
 
     tp = sub.add_parser("timing", help="same-realm dips vs the variant's own baseline")
@@ -370,12 +409,13 @@ def main():
     config = Config()
     conn = open_db(config.data_dir / "coinwarden.sqlite")
     if args.command == "spreads":
-        rows = cross_realm_spreads(conn, args.min_sell_listings, args.sanity_multiple, args.max_buy,
+        rows = cross_realm_spreads(conn, args.min_sold_evidence, args.sanity_multiple, args.max_buy,
                                    args.min_profit, args.min_roi, args.max_roi, args.limit)
         _print_spreads(rows)
     else:
         rows = timing_flips(conn, args.window_days, args.min_days, args.min_samples, args.min_turnover,
-                            args.min_discount, args.max_buy, args.min_profit, args.min_roi, args.max_roi, args.limit)
+                            args.min_discount, args.min_sold_evidence, args.max_buy, args.min_profit,
+                            args.min_roi, args.max_roi, args.limit)
         _print_timing(rows)
     conn.close()
 

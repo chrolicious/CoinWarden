@@ -17,10 +17,10 @@ const state = {
   generatedAt: null,
   favorites: new Set(loadFavorites()),
   filters: Object.assign({
-    maxBuy: 100000, minProfit: 500, minRoi: 20, maxRoi: 400, minSellListings: 3,
+    maxBuy: 100000, minProfit: 100, minScore: 0, minSoldEvidence: 1,
     quality: "", itemClass: "", itemSubclass: "", slot: "", search: "", namedOnly: false,
   }, loadJSON("cw.filters", {})),
-  sort: { spreads: ["net_profit", -1], timing: ["net_profit", -1], favorites: ["name", 1] },
+  sort: { spreads: ["score_per_day", -1], timing: ["score_per_day", -1], favorites: ["name", 1] },
   visible: { spreads: PAGE_SIZE, timing: PAGE_SIZE, favorites: PAGE_SIZE },
   detail: null,
   chart: { range: "7d", measure: "min", hidden: new Set() },
@@ -166,8 +166,8 @@ function applyFilters(rows, kind) {
     if (f.slot && info.slot !== f.slot) return false;
     if (r.buy_price > f.maxBuy * COPPER) return false;
     if (r.net_profit < f.minProfit * COPPER) return false;
-    if (r.roi * 100 < f.minRoi || r.roi * 100 > f.maxRoi) return false;
-    if (kind === "spreads" && r.sell_listings < f.minSellListings) return false;
+    if (r.score_per_day < f.minScore * COPPER) return false;
+    if (r.sold_7d < f.minSoldEvidence) return false;
     return true;
   });
 }
@@ -208,9 +208,8 @@ function filterBar(kind, source) {
     select("Quality", "quality", QUALITY_ORDER.filter((q) => infos.some((i) => i.quality === q)), (q) => q.toLowerCase()),
     num("Max buy (g)", "maxBuy", { step: 1000 }),
     num("Min net profit (g)", "minProfit", { step: 100 }),
-    num("Min ROI %", "minRoi", { step: 5 }),
-    num("Max ROI %", "maxRoi", { step: 5 }),
-    kind === "spreads" ? num("Min sell listings", "minSellListings") : null,
+    num("Min EV/day (g)", "minScore", { step: 10 }),
+    num("Min sales seen (7d)", "minSoldEvidence"),
     el("label", { class: "check" }, el("input", { type: "checkbox", checked: f.namedOnly ? "" : null, onchange: (e) => set("namedOnly", e.target.checked) }), "named items only"),
     el("button", { class: "reset", onclick: () => { for (const k of ["quality", "itemClass", "itemSubclass", "slot", "search"]) f[k] = ""; saveJSON("cw.filters", f); render(); } }, "clear"),
   );
@@ -257,38 +256,47 @@ function table(kind, rows, columns) {
     remaining > 0 ? el("div", { class: "more" }, el("button", { onclick: () => { state.visible[kind] += PAGE_SIZE; render(); } },
       `Show ${Math.min(PAGE_SIZE, remaining)} more (${remaining} remaining)`)) : null);
 }
-function salesCell(r) {
-  const sold = r.sold_7d || 0;
-  if (!sold) return el("td", { class: "muted" }, "0", el("div", { class: "realm" }, r.relist_7d ? `${r.relist_7d} relists` : "no sales seen"));
-  return el("td", {}, `${sold} sold`, el("div", { class: "realm" },
-    [r.sold_median_7d ? `@ ${gold(r.sold_median_7d)}` : "", r.days_to_sell != null ? `~${r.days_to_sell} d to sell` : ""].filter(Boolean).join(" · ")));
+// Sold-side cell: the realized 7d sold median is the number the ranking is
+// built on; current ask is shown only as secondary context (it's a wish).
+function soldCell(r, showRealm) {
+  return el("td", {},
+    el("div", {}, showRealm ? el("span", { class: "dot", style: `background:${REALM_COLOR[r.sell_realm] || "var(--muted)"}` }) : null,
+      `sold @ ${goldFull(r.sold_median_7d)}`),
+    el("div", { class: "realm" }, `${r.sold_7d}× in 7d · ask ${gold(r.current_ask)} x${r.sell_listings}`));
+}
+function evDayCell(r) {
+  return el("td", { class: r.score_per_day > 0 ? "pos" : "neg" }, goldFull(r.score_per_day) + "/d",
+    el("div", { class: "realm" }, `${pct(r.p_sold_48h)} in 48h · ~${r.days_to_sell}d wait`));
+}
+function riskCell(r) {
+  return el("td", { class: r.net_profit > 0 ? "pos" : "neg" }, goldFull(r.net_profit),
+    el("div", { class: "realm" }, `deposit risk ${goldFull(r.deposit_estimate)}`));
 }
 const SPREAD_COLS = [
   { key: "name", label: "Item", left: true, defaultDir: 1, cell: (r) => itemCell(r) },
   { key: "buy_price", label: "Buy", cell: (r) => realmCell(r.buy_realm, r.buy_price, r.buy_listings) },
-  { key: "sell_price", label: "Sell (undercut)", cell: (r) => realmCell(r.sell_realm, r.sell_price, r.sell_listings) },
-  { key: "sold_7d", label: "Sales 7d (sell realm)", cell: salesCell },
-  { key: "net_profit", label: "Net profit", cell: (r) => el("td", { class: r.net_profit > 0 ? "pos" : "neg" }, goldFull(r.net_profit)) },
-  { key: "roi", label: "ROI", cell: (r) => el("td", {}, pct(r.roi)) },
+  { key: "sold_median_7d", label: "Sold on (7d evidence)", cell: (r) => soldCell(r, true) },
+  { key: "score_per_day", label: "EV / day locked", cell: evDayCell },
+  { key: "net_profit", label: "Net if sold", cell: riskCell },
   { key: "realm_count", label: "Realms", cell: (r) => el("td", {}, r.realm_count) },
 ];
 const TIMING_COLS = [
   { key: "name", label: "Item", left: true, defaultDir: 1, cell: (r) => itemCell(r) },
   { key: "realm_slug", label: "Realm", left: true, defaultDir: 1, cell: (r) => el("td", { class: "left" }, el("span", { class: "dot", style: `background:${REALM_COLOR[r.realm_slug]}` }), r.realm_slug) },
-  { key: "buy_price", label: "Now", cell: (r) => el("td", {}, goldFull(r.buy_price), el("div", { class: "realm" }, `${r.listing_count} listed`)) },
-  { key: "p50", label: "Normal (p50)", cell: (r) => el("td", {}, goldFull(r.p50), el("div", { class: "realm" }, `${gold(r.p25)}–${gold(r.p75)} · ${r.source === "daily" ? `${r.days} d` : `${r.samples} h`}`)) },
+  { key: "buy_price", label: "Now", cell: (r) => el("td", {}, goldFull(r.buy_price), el("div", { class: "realm" }, `${r.sell_listings} listed`)) },
+  { key: "p50", label: "Normal ask (p50)", cell: (r) => el("td", {}, goldFull(r.p50), el("div", { class: "realm" }, `${gold(r.p25)}–${gold(r.p75)} · ${r.source === "daily" ? `${r.days} d` : `${r.samples} h`}`)) },
   { key: "discount", label: "Discount", cell: (r) => el("td", { class: "pos" }, pct(r.discount)) },
-  { key: "sold_7d", label: "Sales 7d", cell: salesCell },
-  { key: "net_profit", label: "Net profit", cell: (r) => el("td", { class: r.net_profit > 0 ? "pos" : "neg" }, goldFull(r.net_profit)) },
-  { key: "roi", label: "ROI", cell: (r) => el("td", {}, pct(r.roi)) },
+  { key: "sold_median_7d", label: "Sold (7d evidence)", cell: (r) => soldCell(r, false) },
+  { key: "score_per_day", label: "EV / day locked", cell: evDayCell },
+  { key: "net_profit", label: "Net if sold", cell: riskCell },
   { key: "turnover_events", label: "Turnover", cell: (r) => el("td", {}, r.turnover_events) },
   { key: "zscore", label: "z", cell: (r) => el("td", {}, r.zscore) },
 ];
 const FAV_COLS = [
   { key: "name", label: "Item", left: true, defaultDir: 1, cell: (r) => itemCell(r) },
   { key: "spread", label: "Best spread", cell: (r) => r.spread ? realmCell(r.spread.buy_realm, r.spread.buy_price, r.spread.buy_listings) : el("td", { class: "realm" }, "—") },
-  { key: "spread_net", label: "Spread net", cell: (r) => el("td", { class: r.spread ? "pos" : "" }, r.spread ? goldFull(r.spread.net_profit) : "—") },
-  { key: "timing_net", label: "Timing net", cell: (r) => el("td", { class: r.timing ? "pos" : "" }, r.timing ? `${goldFull(r.timing.net_profit)} on ${r.timing.realm_slug}` : "—") },
+  { key: "spread_net", label: "Spread EV/day", cell: (r) => el("td", { class: r.spread ? "pos" : "" }, r.spread ? `${goldFull(r.spread.score_per_day)}/d` : "—") },
+  { key: "timing_net", label: "Timing EV/day", cell: (r) => el("td", { class: r.timing ? "pos" : "" }, r.timing ? `${goldFull(r.timing.score_per_day)}/d on ${r.timing.realm_slug}` : "—") },
 ];
 
 // ---------- views ----------
@@ -303,9 +311,9 @@ function renderList() {
   if (state.tab === "favorites") {
     const rows = [...state.favorites].map((key) => {
       const { itemId, variant } = splitKey(key);
-      const spread = sortRows(state.spreads.filter((r) => rowKey(r) === key), ["net_profit", -1])[0] || null;
-      const timing = sortRows(state.timing.filter((r) => rowKey(r) === key), ["net_profit", -1])[0] || null;
-      return { item_id: itemId, variant, spread, timing, spread_net: spread?.net_profit ?? -1, timing_net: timing?.net_profit ?? -1 };
+      const spread = sortRows(state.spreads.filter((r) => rowKey(r) === key), ["score_per_day", -1])[0] || null;
+      const timing = sortRows(state.timing.filter((r) => rowKey(r) === key), ["score_per_day", -1])[0] || null;
+      return { item_id: itemId, variant, spread, timing, spread_net: spread?.score_per_day ?? -1, timing_net: timing?.score_per_day ?? -1 };
     });
     app.append(el("p", { class: "count" }, rows.length ? `${rows.length} favorites` : "Star items in the other tabs or on an item page to track them here."));
     app.append(table("favorites", rows, FAV_COLS));
@@ -389,11 +397,11 @@ function renderDetail() {
     })));
   }
 
-  const spread = sortRows(state.spreads.filter((r) => rowKey(r) === key), ["net_profit", -1])[0];
+  const spread = sortRows(state.spreads.filter((r) => rowKey(r) === key), ["score_per_day", -1])[0];
   if (spread) {
     app.append(el("div", { class: "grid" },
-      el("div", { class: "tile" }, el("div", { class: "l" }, "Best cross-realm flip"), el("div", { class: "v pos" }, goldFull(spread.net_profit)),
-        el("div", { class: "d" }, `buy ${spread.buy_realm} ${goldFull(spread.buy_price)} → sell ${spread.sell_realm} ${goldFull(spread.sell_price)} · ROI ${pct(spread.roi)}`))));
+      el("div", { class: "tile" }, el("div", { class: "l" }, "Best cross-realm flip"), el("div", { class: "v pos" }, `${goldFull(spread.score_per_day)}/day`),
+        el("div", { class: "d" }, `buy ${spread.buy_realm} ${goldFull(spread.buy_price)} → sold ${spread.sell_realm} @ ${goldFull(spread.sold_median_7d)} (${spread.sold_7d}× in 7d) · net ${goldFull(spread.net_profit)} · P(sold 48h) ${pct(spread.p_sold_48h)}`))));
   }
 
   if (hasAny) app.append(chartCard(history));

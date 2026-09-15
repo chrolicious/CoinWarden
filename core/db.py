@@ -1,3 +1,4 @@
+import math
 import sqlite3
 import time
 from pathlib import Path
@@ -160,6 +161,10 @@ def open_db(path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA synchronous = NORMAL")
+    # SQLite's built-in EXP() depends on a compile-time flag that varies by
+    # platform/distribution; registering it explicitly guarantees it behaves
+    # the same locally and on the CI runner regardless of the underlying build.
+    conn.create_function("EXP", 1, math.exp, deterministic=True)
     _migrate(conn)
     conn.executescript(SCHEMA)
     return conn
