@@ -72,6 +72,15 @@ function itemInfo(itemId, row) {
     named: Boolean(i.name || row?.name),
   };
 }
+// Wowhead link: hover shows the full in-game tooltip via their widget, click
+// opens Wowhead in a new tab without triggering the row's detail navigation.
+function whLink(itemId, text) {
+  return el("a", { class: "wh", href: `https://www.wowhead.com/item=${itemId}`, target: "_blank", rel: "noopener",
+    onclick: (e) => e.stopPropagation() }, text);
+}
+function refreshTooltips() {
+  if (window.$WowheadPower?.refreshLinks) window.$WowheadPower.refreshLinks();
+}
 function slotLabel(slot) {
   return slot.toLowerCase().replace(/_/g, " ").replace("non equip", "not equippable");
 }
@@ -173,7 +182,7 @@ function itemCell(itemId, row) {
   const info = itemInfo(itemId, row);
   return el("td", { class: "item left" },
     info.icon ? el("img", { src: info.icon, alt: "", loading: "lazy" }) : el("span", { style: "width:24px;height:24px" }),
-    el("div", {}, el("div", { class: "name" }, info.name), el("div", { class: "sub" },
+    el("div", {}, el("div", { class: "name" }, whLink(itemId, info.name)), el("div", { class: "sub" },
       [info.quality.toLowerCase(), info.cls, info.slot ? slotLabel(info.slot) : "", info.level ? `ilvl ${info.level}` : ""].filter(Boolean).join(" · "))));
 }
 function realmCell(realm, price, listings) {
@@ -270,7 +279,7 @@ function renderDetail() {
   app.append(el("button", { class: "back", onclick: () => { state.detail = null; location.hash = state.tab; render(); } }, "← back"));
   app.append(el("div", { class: "detail-head" },
     info.icon ? el("img", { src: info.icon, alt: "" }) : null,
-    el("div", {}, el("h2", {}, info.name, " ", starButton(itemId)), el("div", { class: "sub" }, [info.quality.toLowerCase(), info.cls, `item ${itemId}`].filter(Boolean).join(" · "))),
+    el("div", {}, el("h2", {}, whLink(itemId, info.name), " ", starButton(itemId)), el("div", { class: "sub" }, [info.quality.toLowerCase(), info.cls, `item ${itemId}`].filter(Boolean).join(" · "))),
   ));
 
   if (history === null) { app.append(el("div", { class: "chart-empty" }, "loading history…")); return; }
@@ -417,6 +426,7 @@ function niceTicks(min, max, count) {
 function render() {
   if (!state.spreads) return;
   if (state.detail) renderDetail(); else renderList();
+  refreshTooltips();
 }
 function route() {
   const h = location.hash.slice(1);
