@@ -257,10 +257,17 @@ function table(kind, rows, columns) {
     remaining > 0 ? el("div", { class: "more" }, el("button", { onclick: () => { state.visible[kind] += PAGE_SIZE; render(); } },
       `Show ${Math.min(PAGE_SIZE, remaining)} more (${remaining} remaining)`)) : null);
 }
+function salesCell(r) {
+  const sold = r.sold_7d || 0;
+  if (!sold) return el("td", { class: "muted" }, "0", el("div", { class: "realm" }, r.relist_7d ? `${r.relist_7d} relists` : "no sales seen"));
+  return el("td", {}, `${sold} sold`, el("div", { class: "realm" },
+    [r.sold_median_7d ? `@ ${gold(r.sold_median_7d)}` : "", r.days_to_sell != null ? `~${r.days_to_sell} d to sell` : ""].filter(Boolean).join(" · ")));
+}
 const SPREAD_COLS = [
   { key: "name", label: "Item", left: true, defaultDir: 1, cell: (r) => itemCell(r) },
   { key: "buy_price", label: "Buy", cell: (r) => realmCell(r.buy_realm, r.buy_price, r.buy_listings) },
   { key: "sell_price", label: "Sell (undercut)", cell: (r) => realmCell(r.sell_realm, r.sell_price, r.sell_listings) },
+  { key: "sold_7d", label: "Sales 7d (sell realm)", cell: salesCell },
   { key: "net_profit", label: "Net profit", cell: (r) => el("td", { class: r.net_profit > 0 ? "pos" : "neg" }, goldFull(r.net_profit)) },
   { key: "roi", label: "ROI", cell: (r) => el("td", {}, pct(r.roi)) },
   { key: "realm_count", label: "Realms", cell: (r) => el("td", {}, r.realm_count) },
@@ -271,6 +278,7 @@ const TIMING_COLS = [
   { key: "buy_price", label: "Now", cell: (r) => el("td", {}, goldFull(r.buy_price), el("div", { class: "realm" }, `${r.listing_count} listed`)) },
   { key: "p50", label: "Normal (p50)", cell: (r) => el("td", {}, goldFull(r.p50), el("div", { class: "realm" }, `${gold(r.p25)}–${gold(r.p75)} · ${r.source === "daily" ? `${r.days} d` : `${r.samples} h`}`)) },
   { key: "discount", label: "Discount", cell: (r) => el("td", { class: "pos" }, pct(r.discount)) },
+  { key: "sold_7d", label: "Sales 7d", cell: salesCell },
   { key: "net_profit", label: "Net profit", cell: (r) => el("td", { class: r.net_profit > 0 ? "pos" : "neg" }, goldFull(r.net_profit)) },
   { key: "roi", label: "ROI", cell: (r) => el("td", {}, pct(r.roi)) },
   { key: "turnover_events", label: "Turnover", cell: (r) => el("td", {}, r.turnover_events) },
@@ -360,6 +368,26 @@ function renderDetail() {
   const hasAny = history.hourly.length || history.daily.length;
   app.append(el("div", { class: "grid" }, ...tiles, tiles.length ? null : el("div", { class: "tile" }, el("div", { class: "d" },
     hasAny ? "Not listed on any tracked realm in the last 3 days." : "No published history for this variant yet — histories cover variants that appeared in the lists within the last 7 days."))));
+
+  const sales = history.sales || [];
+  if (sales.length) {
+    const byRealm = new Map();
+    for (const s of sales) {
+      const cur = byRealm.get(s.realm_slug) || { sold: 0, relist: 0, expired: 0, medians: [] };
+      cur.sold += s.sold_count; cur.relist += s.relist_count; cur.expired += s.expired_count;
+      if (s.sold_median_price) cur.medians.push(s.sold_median_price);
+      byRealm.set(s.realm_slug, cur);
+    }
+    const days = new Set(sales.map((s) => s.day)).size;
+    app.append(el("div", { class: "grid" }, ...REALM_ORDER.filter((r) => byRealm.has(r)).map((realm) => {
+      const s = byRealm.get(realm);
+      const med = s.medians.length ? s.medians.sort((a, b) => a - b)[Math.floor(s.medians.length / 2)] : null;
+      return el("div", { class: "tile" },
+        el("div", { class: "l" }, el("span", { class: "dot", style: `background:${REALM_COLOR[realm]}` }), `${realm} sales · ${days} d`),
+        el("div", { class: "v" }, `${s.sold} sold`),
+        el("div", { class: "d" }, [med ? `median ${goldFull(med)}` : "", `${s.relist} relists`, `${s.expired} expired`].filter(Boolean).join(" · ")));
+    })));
+  }
 
   const spread = sortRows(state.spreads.filter((r) => rowKey(r) === key), ["net_profit", -1])[0];
   if (spread) {

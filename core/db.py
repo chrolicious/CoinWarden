@@ -43,6 +43,57 @@ CREATE TABLE IF NOT EXISTS daily_item_prices (
 CREATE INDEX IF NOT EXISTS idx_daily_item
     ON daily_item_prices (item_id, variant, day);
 
+CREATE TABLE IF NOT EXISTS active_listings (
+    connected_realm_id INTEGER NOT NULL,
+    auction_id INTEGER NOT NULL,
+    realm_slug TEXT NOT NULL,
+    item_id INTEGER NOT NULL,
+    variant TEXT NOT NULL DEFAULT '',
+    unit_price INTEGER NOT NULL,
+    quantity INTEGER NOT NULL,
+    time_left TEXT NOT NULL,
+    first_seen TEXT NOT NULL,
+    last_seen TEXT NOT NULL,
+    PRIMARY KEY (connected_realm_id, auction_id)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS sale_events (
+    connected_realm_id INTEGER NOT NULL,
+    auction_id INTEGER NOT NULL,
+    realm_slug TEXT NOT NULL,
+    item_id INTEGER NOT NULL,
+    variant TEXT NOT NULL DEFAULT '',
+    unit_price INTEGER NOT NULL,
+    quantity INTEGER NOT NULL,
+    last_time_left TEXT NOT NULL,
+    first_seen TEXT NOT NULL,
+    vanished_at TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    PRIMARY KEY (connected_realm_id, auction_id)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_sale_events_item
+    ON sale_events (item_id, variant, vanished_at);
+
+CREATE TABLE IF NOT EXISTS daily_sales (
+    realm_slug TEXT NOT NULL,
+    connected_realm_id INTEGER NOT NULL,
+    item_id INTEGER NOT NULL,
+    variant TEXT NOT NULL DEFAULT '',
+    day TEXT NOT NULL,
+    sold_count INTEGER NOT NULL,
+    sold_quantity INTEGER NOT NULL,
+    sold_min_price INTEGER,
+    sold_median_price INTEGER,
+    sold_max_price INTEGER,
+    relist_count INTEGER NOT NULL,
+    expired_count INTEGER NOT NULL,
+    PRIMARY KEY (connected_realm_id, item_id, variant, day)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_daily_sales_item
+    ON daily_sales (item_id, variant, day);
+
 CREATE TABLE IF NOT EXISTS featured_items (
     item_id INTEGER NOT NULL,
     variant TEXT NOT NULL DEFAULT '',
@@ -170,11 +221,58 @@ def rollup_days(conn: sqlite3.Connection, day_from: str, day_to_exclusive: str) 
     return cur.rowcount
 
 
-def prune(conn: sqlite3.Connection, hourly_cutoff_iso: str, daily_cutoff_day: str) -> tuple[int, int]:
+# One row per (realm, item, variant, day) from the raw sale events. 'sold'
+# events drive count and price stats; relists and expiries are kept as
+# counts so a hot-looking item with heavy relisting can be spotted.
+SALES_ROLLUP_SQL = """
+WITH ev AS (
+    SELECT realm_slug, connected_realm_id, item_id, variant, substr(vanished_at, 1, 10) AS day,
+           unit_price, quantity, kind
+    FROM sale_events
+    WHERE vanished_at >= ? AND vanished_at < ?
+),
+sold AS (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY connected_realm_id, item_id, variant, day ORDER BY unit_price) AS rn,
+              COUNT(*) OVER (PARTITION BY connected_realm_id, item_id, variant, day) AS n
+    FROM ev WHERE kind = 'sold'
+),
+sold_agg AS (
+    SELECT connected_realm_id, item_id, variant, day,
+           COUNT(*) AS sold_count, SUM(quantity) AS sold_quantity,
+           MIN(unit_price) AS sold_min, MAX(CASE WHEN rn = (n + 1) / 2 THEN unit_price END) AS sold_median,
+           MAX(unit_price) AS sold_max
+    FROM sold GROUP BY connected_realm_id, item_id, variant, day
+),
+other_agg AS (
+    SELECT realm_slug, connected_realm_id, item_id, variant, day,
+           SUM(kind = 'relist') AS relists, SUM(kind = 'expired') AS expired
+    FROM ev GROUP BY connected_realm_id, item_id, variant, day
+)
+INSERT OR REPLACE INTO daily_sales
+    (realm_slug, connected_realm_id, item_id, variant, day, sold_count, sold_quantity,
+     sold_min_price, sold_median_price, sold_max_price, relist_count, expired_count)
+SELECT o.realm_slug, o.connected_realm_id, o.item_id, o.variant, o.day,
+       COALESCE(s.sold_count, 0), COALESCE(s.sold_quantity, 0), s.sold_min, s.sold_median, s.sold_max,
+       o.relists, o.expired
+FROM other_agg o
+LEFT JOIN sold_agg s ON s.connected_realm_id = o.connected_realm_id AND s.item_id = o.item_id
+                     AND s.variant = o.variant AND s.day = o.day
+"""
+
+
+def rollup_sales(conn: sqlite3.Connection, from_iso: str, to_iso_exclusive: str) -> None:
+    with conn:
+        conn.execute(SALES_ROLLUP_SQL, (from_iso, to_iso_exclusive))
+
+
+def prune(conn: sqlite3.Connection, hourly_cutoff_iso: str, daily_cutoff_day: str,
+          events_cutoff_iso: str) -> tuple[int, int, int]:
     with conn:
         hourly = conn.execute("DELETE FROM item_price_snapshots WHERE fetched_at < ?", (hourly_cutoff_iso,)).rowcount
         daily = conn.execute("DELETE FROM daily_item_prices WHERE day < ?", (daily_cutoff_day,)).rowcount
-    return hourly, daily
+        conn.execute("DELETE FROM daily_sales WHERE day < ?", (daily_cutoff_day,))
+        events = conn.execute("DELETE FROM sale_events WHERE vanished_at < ?", (events_cutoff_iso,)).rowcount
+    return hourly, daily, events
 
 
 def get_known_item_ids(conn: sqlite3.Connection) -> set[int]:
@@ -214,4 +312,9 @@ def replace_bonus_data(conn: sqlite3.Connection, rows: list[tuple[int, str]]) ->
 
 def compact(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    conn.execute("VACUUM")
+    pages = conn.execute("PRAGMA page_count").fetchone()[0]
+    free = conn.execute("PRAGMA freelist_count").fetchone()[0]
+    if pages and free / pages > 0.15:
+        t0 = time.monotonic()
+        conn.execute("VACUUM")
+        print(f"db: vacuumed ({free}/{pages} free pages) in {time.monotonic() - t0:.1f}s", flush=True)

@@ -9,8 +9,9 @@ from datetime import datetime, timedelta, timezone
 
 from core.config import Config
 from core.api_client import BattleNetClient
-from core.db import open_db, insert_item_snapshots, rollup_days, prune, compact, replace_bonus_data
+from core.db import open_db, insert_item_snapshots, rollup_days, rollup_sales, prune, compact, replace_bonus_data
 from core.items import sync_item_metadata
+from core.listings import diff_and_store
 from core.scoring import publish
 from core.storage import get_storage
 from core.variants import variant_key, fetch_bonus_table, serialize
@@ -103,6 +104,13 @@ def _run():
         print(f"  {len(aggregates)} item variants across {len(seen_item_ids)} items so far", flush=True)
         insert_item_snapshots(conn, rows)
 
+        c = diff_and_store(conn, realm_slug, connected_realm_id, auctions, variant_key, fetched_at)
+        if c["first_run"]:
+            print(f"  listings: tracking {c['tracked']} (first run, no events yet) in {c['seconds']}s", flush=True)
+        else:
+            print(f"  listings: tracking {c['tracked']}, sold {c['sold']}, relist {c['relist']}, "
+                  f"expired {c['expired']} in {c['seconds']}s", flush=True)
+
     sync_item_metadata(client, conn, seen_item_ids)
 
     bonus_table = fetch_bonus_table()
@@ -115,12 +123,17 @@ def _run():
     hourly_cutoff = (now - timedelta(days=config.hourly_retention_days)).isoformat()
     earliest = conn.execute("SELECT MIN(fetched_at) FROM item_price_snapshots").fetchone()[0] or fetched_at
     t0 = time.monotonic()
-    rolled = rollup_days(conn, earliest[:10], today)
-    print(f"rolled up {rolled} daily rows in {time.monotonic() - t0:.2f}s", flush=True)
-    pruned_hourly, pruned_daily = prune(conn, hourly_cutoff,
-                                       (now - timedelta(days=config.daily_retention_days)).strftime("%Y-%m-%d"))
-    print(f"pruned {pruned_hourly} hourly rows (> {config.hourly_retention_days} d) "
-          f"and {pruned_daily} daily rows (> {config.daily_retention_days} d)", flush=True)
+    rollup_days(conn, earliest[:10], today)
+    # Sales roll up including today, so velocity columns reflect the last 24h;
+    # the day's row is simply replaced on each run.
+    events_from = (now - timedelta(days=config.events_retention_days)).isoformat()
+    rollup_sales(conn, events_from, (now + timedelta(days=1)).strftime("%Y-%m-%d"))
+    print(f"rollups done in {time.monotonic() - t0:.2f}s", flush=True)
+    daily_cutoff = (now - timedelta(days=config.daily_retention_days)).strftime("%Y-%m-%d")
+    pruned_hourly, pruned_daily, pruned_events = prune(conn, hourly_cutoff, daily_cutoff, events_from)
+    print(f"pruned {pruned_hourly} hourly rows (> {config.hourly_retention_days} d), "
+          f"{pruned_daily} daily rows (> {config.daily_retention_days} d), "
+          f"{pruned_events} sale events (> {config.events_retention_days} d)", flush=True)
 
     t0 = time.monotonic()
     publish(conn, storage, fetched_at)

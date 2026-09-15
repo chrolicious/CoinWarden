@@ -17,15 +17,32 @@ def _rows(conn: sqlite3.Connection, sql: str, params: list) -> list[dict]:
     return [dict(zip(cols, row)) for row in cur.fetchall()]
 
 
+SALES_WINDOW_DAYS = 7
+
+
 def ensure_latest_snapshot(conn: sqlite3.Connection) -> None:
-    """Materialise the newest snapshot once; the scoring CTEs read it several
-    times and SQLite would otherwise re-scan the whole table for each."""
-    conn.executescript("""
+    """Materialise the newest snapshot and a 7-day sales summary once; the
+    scoring CTEs read them several times and SQLite would otherwise re-scan
+    the tables for each."""
+    window_start = (datetime.now(timezone.utc) - timedelta(days=SALES_WINDOW_DAYS)).strftime("%Y-%m-%d")
+    conn.executescript(f"""
         DROP TABLE IF EXISTS temp.latest_snapshot;
         CREATE TEMP TABLE latest_snapshot AS
             SELECT * FROM item_price_snapshots
             WHERE fetched_at = (SELECT MAX(fetched_at) FROM item_price_snapshots);
         CREATE INDEX temp.idx_latest_item ON latest_snapshot (item_id, variant);
+
+        DROP TABLE IF EXISTS temp.sales_7d;
+        CREATE TEMP TABLE sales_7d AS
+            SELECT connected_realm_id, item_id, variant,
+                   SUM(sold_count) AS sold_7d,
+                   SUM(relist_count) AS relist_7d,
+                   SUM(expired_count) AS expired_7d,
+                   MAX(sold_median_price) AS sold_median_7d
+            FROM daily_sales
+            WHERE day >= '{window_start}'
+            GROUP BY connected_realm_id, item_id, variant;
+        CREATE INDEX temp.idx_sales_7d ON sales_7d (connected_realm_id, item_id, variant);
     """)
 
 
@@ -56,15 +73,19 @@ buy AS (
     FROM latest
 ),
 sell AS (
-    SELECT item_id, variant, realm_slug AS sell_realm, min_unit_price AS sell_price,
-           median_unit_price AS sell_median, listing_count AS sell_listings,
-           ROW_NUMBER() OVER (PARTITION BY item_id, variant ORDER BY min_unit_price DESC) AS rn
-    FROM latest
-    WHERE listing_count >= ?
+    SELECT l.item_id, l.variant, l.realm_slug AS sell_realm, l.min_unit_price AS sell_price,
+           l.median_unit_price AS sell_median, l.listing_count AS sell_listings,
+           COALESCE(s.sold_7d, 0) AS sold_7d, s.sold_median_7d, COALESCE(s.relist_7d, 0) AS relist_7d,
+           ROW_NUMBER() OVER (PARTITION BY l.item_id, l.variant ORDER BY l.min_unit_price DESC) AS rn
+    FROM latest l
+    LEFT JOIN sales_7d s ON s.connected_realm_id = l.connected_realm_id AND s.item_id = l.item_id AND s.variant = l.variant
+    WHERE l.listing_count >= ?
 ),
 spread AS (
     SELECT b.item_id, b.variant, b.buy_realm, b.buy_price, b.buy_listings,
            s.sell_realm, s.sell_price, s.sell_median, s.sell_listings,
+           s.sold_7d, s.sold_median_7d, s.relist_7d,
+           CASE WHEN s.sold_7d > 0 THEN ROUND(1.0 * s.sell_listings * {SALES_WINDOW_DAYS} / s.sold_7d, 1) END AS days_to_sell,
            a.anchor_price, a.realm_count,
            CAST(s.sell_price * (1 - {AH_CUT}) - b.buy_price AS INTEGER) AS net_profit
     FROM buy b
@@ -77,6 +98,7 @@ spread AS (
 SELECT sp.item_id, sp.variant, i.name, i.quality, i.item_class, i.item_subclass,
        sp.buy_realm, sp.buy_price, sp.buy_listings,
        sp.sell_realm, sp.sell_price, sp.sell_median, sp.sell_listings,
+       sp.sold_7d, sp.sold_median_7d, sp.relist_7d, sp.days_to_sell,
        sp.anchor_price, sp.realm_count, sp.net_profit,
        ROUND(1.0 * sp.net_profit / sp.buy_price, 2) AS roi
 FROM spread sp
@@ -159,16 +181,20 @@ latest AS (
 scored AS (
     SELECT l.item_id, l.variant, l.realm_slug, l.min_unit_price AS buy_price, l.listing_count,
            b.p25, b.p50, b.p75, b.days, b.samples, b.source, b.turnover_events,
+           COALESCE(s.sold_7d, 0) AS sold_7d, s.sold_median_7d, COALESCE(s.relist_7d, 0) AS relist_7d,
+           CASE WHEN s.sold_7d > 0 THEN ROUND(1.0 * l.listing_count * {SALES_WINDOW_DAYS} / s.sold_7d, 1) END AS days_to_sell,
            1.0 - 1.0 * l.min_unit_price / b.p50 AS discount,
            CAST(b.p50 * (1 - {AH_CUT}) - l.min_unit_price AS INTEGER) AS net_profit,
            ROUND(1.0 * (b.p50 - l.min_unit_price) / MAX(b.p75 - b.p25, b.p50 * 0.05), 1) AS zscore
     FROM latest l
     JOIN baseline b ON b.connected_realm_id = l.connected_realm_id AND b.item_id = l.item_id AND b.variant = l.variant
+    LEFT JOIN sales_7d s ON s.connected_realm_id = l.connected_realm_id AND s.item_id = l.item_id AND s.variant = l.variant
     WHERE b.samples >= ?
       AND b.turnover_events >= ?
 )
 SELECT sc.item_id, sc.variant, i.name, sc.realm_slug, sc.buy_price, sc.listing_count,
        sc.p25, sc.p50, sc.p75, sc.days, sc.samples, sc.source, sc.turnover_events,
+       sc.sold_7d, sc.sold_median_7d, sc.relist_7d, sc.days_to_sell,
        ROUND(sc.discount, 2) AS discount, sc.net_profit,
        ROUND(1.0 * sc.net_profit / sc.buy_price, 2) AS roi, sc.zscore
 FROM scored sc
@@ -226,6 +252,15 @@ WHERE f.last_featured_at >= ?
 ORDER BY d.item_id, d.variant, d.day
 """
 
+SALES_HISTORY_SQL = """
+SELECT s.item_id, s.variant, s.realm_slug, s.day, s.sold_count, s.sold_quantity,
+       s.sold_min_price, s.sold_median_price, s.sold_max_price, s.relist_count, s.expired_count
+FROM featured_items f
+JOIN daily_sales s ON s.item_id = f.item_id AND s.variant = f.variant
+WHERE f.last_featured_at >= ?
+ORDER BY s.item_id, s.variant, s.day
+"""
+
 
 def _publish_bonus_subset(conn: sqlite3.Connection, storage, variants: set[str], fetched_at: str) -> int:
     ids = set()
@@ -261,11 +296,11 @@ def publish(conn: sqlite3.Connection, storage, fetched_at: str) -> None:
     bonus_count = _publish_bonus_subset(conn, storage, {v for _, v in featured}, fetched_at)
 
     shards: list[dict[str, dict]] = [{} for _ in range(HISTORY_SHARDS)]
-    for sql, bucket in ((HOURLY_HISTORY_SQL, "hourly"), (DAILY_HISTORY_SQL, "daily")):
+    for sql, bucket in ((HOURLY_HISTORY_SQL, "hourly"), (DAILY_HISTORY_SQL, "daily"), (SALES_HISTORY_SQL, "sales")):
         for r in _rows(conn, sql, [retention_start]):
             item_id = r.pop("item_id")
             key = f"{item_id}|{r.pop('variant')}"
-            shards[item_id % HISTORY_SHARDS].setdefault(key, {"hourly": [], "daily": []})[bucket].append(r)
+            shards[item_id % HISTORY_SHARDS].setdefault(key, {"hourly": [], "daily": [], "sales": []})[bucket].append(r)
     published = sum(len(s) for s in shards)
     shard_files = [(f"history/{i}.json", {"generated_at": fetched_at, "shards": HISTORY_SHARDS, "items": s})
                    for i, s in enumerate(shards)]
@@ -294,11 +329,12 @@ def _label(r: dict) -> str:
 
 
 def _print_spreads(rows: list[dict]) -> None:
-    print(f"{'item':<46} {'buy':<24} {'sell':<24} {'anchor':>9} {'net':>9} {'roi':>6}")
+    print(f"{'item':<46} {'buy':<24} {'sell':<24} {'sold7d':>6} {'d2sell':>6} {'net':>9} {'roi':>6}")
     for r in rows:
         buy = f"{r['buy_realm'][:10]} {_gold(r['buy_price'])} x{r['buy_listings']}"
         sell = f"{r['sell_realm'][:10]} {_gold(r['sell_price'])} x{r['sell_listings']}"
-        print(f"{_label(r):<46} {buy:<24} {sell:<24} {_gold(r['anchor_price']):>9} "
+        d2s = f"{r['days_to_sell']:.0f}" if r["days_to_sell"] is not None else "-"
+        print(f"{_label(r):<46} {buy:<24} {sell:<24} {r['sold_7d']:>6} {d2s:>6} "
               f"{_gold(r['net_profit']):>9} {r['roi']:>6.0%}")
 
 

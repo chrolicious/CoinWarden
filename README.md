@@ -32,6 +32,10 @@ Nothing runs on a personal machine and the frontend needs no database credential
 4. `python -m core.main` — one full pipeline run.
 5. `python -m core.scoring spreads` / `python -m core.scoring timing` — run the scoring queries against the local database with your own thresholds.
 
+## Sale detection
+
+Snapshot prices are asking prices. To estimate what actually sells, each run keeps the current set of listings (>= 100g) per realm and diffs it against the previous hour: a listing that vanished with at least two hours left cannot have expired, so it is recorded as **sold** - unless a cheaper listing of the same variant appeared on the same realm in the same hour, which is recorded as a **relist** (cancel-and-undercut). Vanishes from the SHORT/MEDIUM buckets are recorded as **expired**. Events are rolled into `daily_sales` (count, sold price min/median/max, relists, expiries) and surfaced as sales per 7 days and an estimated days-to-sell (supply / sales rate). Cancellations of long listings are indistinguishable from sales, so velocity is an upper bound.
+
 ## Scoring
 
 - **Cross-realm spread**: buy at the cheapest listing on the cheapest realm, sell by undercutting the cheapest listing on the best other realm, net of the 5% AH cut. Items move between realms via the Warband bank.

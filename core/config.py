@@ -20,10 +20,13 @@ class Config:
     r2_access_key_id = os.environ.get("R2_ACCESS_KEY_ID")
     r2_secret_access_key = os.environ.get("R2_SECRET_ACCESS_KEY")
     r2_bucket = os.environ.get("R2_BUCKET", "coinwarden")
+    # "local" forces LocalStorage even when R2 credentials exist (safe test runs).
+    storage_mode = os.environ.get("COINWARDEN_STORAGE", "r2")
 
     data_dir = Path(os.environ.get("COINWARDEN_DATA_DIR", "data"))
-    hourly_retention_days = int(os.environ.get("COINWARDEN_HOURLY_RETENTION_DAYS", "3"))
+    hourly_retention_days = int(os.environ.get("COINWARDEN_HOURLY_RETENTION_DAYS", "2"))
     daily_retention_days = int(os.environ.get("COINWARDEN_DAILY_RETENTION_DAYS", "60"))
+    events_retention_days = int(os.environ.get("COINWARDEN_EVENTS_RETENTION_DAYS", "14"))
 
     @property
     def r2_configured(self) -> bool:

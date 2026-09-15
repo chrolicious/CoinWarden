@@ -90,7 +90,7 @@ class LocalStorage:
 
 
 def get_storage(config: Config):
-    if config.r2_configured:
+    if config.r2_configured and config.storage_mode != "local":
         return R2Storage(config)
-    print("storage: R2 not configured, using local mode", flush=True)
+    print("storage: local mode (nothing is uploaded)", flush=True)
     return LocalStorage(config)
