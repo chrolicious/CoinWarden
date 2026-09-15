@@ -63,7 +63,8 @@
   tbody tr { cursor: pointer; }
   tbody tr:hover { background: var(--hover); }
   td.item { display: flex; align-items: center; gap: 8px; min-width: 240px; white-space: normal; }
-  td.item img { width: 24px; height: 24px; border-radius: 4px; background: var(--grid); flex: none; }
+  td.item img { width: 24px; height: 24px; border-radius: 4px; background: var(--grid); flex: none; display: block; }
+  td.item a.wh:has(img), .detail-head a.wh:has(img) { flex: none; line-height: 0; }
   td.item .name { font-weight: 500; }
   a.wh { color: inherit; text-decoration: none; }
   a.wh:hover { text-decoration: underline; }

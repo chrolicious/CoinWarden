@@ -181,7 +181,7 @@ function toggleFavorite(itemId) {
 function itemCell(itemId, row) {
   const info = itemInfo(itemId, row);
   return el("td", { class: "item left" },
-    info.icon ? el("img", { src: info.icon, alt: "", loading: "lazy" }) : el("span", { style: "width:24px;height:24px" }),
+    info.icon ? whLink(itemId, el("img", { src: info.icon, alt: "", loading: "lazy" })) : el("span", { style: "width:24px;height:24px" }),
     el("div", {}, el("div", { class: "name" }, whLink(itemId, info.name)), el("div", { class: "sub" },
       [info.quality.toLowerCase(), info.cls, info.slot ? slotLabel(info.slot) : "", info.level ? `ilvl ${info.level}` : ""].filter(Boolean).join(" · "))));
 }
@@ -278,7 +278,7 @@ function renderDetail() {
   const info = itemInfo(itemId);
   app.append(el("button", { class: "back", onclick: () => { state.detail = null; location.hash = state.tab; render(); } }, "← back"));
   app.append(el("div", { class: "detail-head" },
-    info.icon ? el("img", { src: info.icon, alt: "" }) : null,
+    info.icon ? whLink(itemId, el("img", { src: info.icon, alt: "" })) : null,
     el("div", {}, el("h2", {}, whLink(itemId, info.name), " ", starButton(itemId)), el("div", { class: "sub" }, [info.quality.toLowerCase(), info.cls, `item ${itemId}`].filter(Boolean).join(" · "))),
   ));
 
