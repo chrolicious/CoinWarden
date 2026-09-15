@@ -5,12 +5,14 @@ import sys
 import time
 import traceback
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from core.config import Config
 from core.api_client import BattleNetClient
-from core.db import get_client, ensure_schema, insert_item_snapshots
+from core.db import open_db, insert_item_snapshots, prune_snapshots, compact
 from core.items import sync_item_metadata
+from core.scoring import publish
+from core.storage import get_storage
 
 
 def _unit_price(auction: dict) -> float | None:
@@ -62,7 +64,7 @@ def _rows_from_aggregates(realm_slug: str, connected_realm_id: int, aggregates: 
 
 
 def main():
-    faulthandler.dump_traceback_later(600, exit=True, file=sys.stderr)
+    faulthandler.dump_traceback_later(900, exit=True, file=sys.stderr)
 
     try:
         _run()
@@ -76,19 +78,13 @@ def main():
 
 
 def _run():
-    print("creating config/client...", flush=True)
     config = Config()
     client = BattleNetClient(config)
+    storage = get_storage(config)
 
-    print("connecting to DB...", flush=True)
-    t0 = time.monotonic()
-    db = get_client(config)
-    print(f"  connected in {time.monotonic() - t0:.2f}s", flush=True)
-
-    print("ensuring schema...", flush=True)
-    t0 = time.monotonic()
-    ensure_schema(db)
-    print(f"  schema ready in {time.monotonic() - t0:.2f}s", flush=True)
+    db_path = config.data_dir / "coinwarden.sqlite"
+    storage.download_db(db_path)
+    conn = open_db(db_path)
 
     fetched_at = datetime.now(timezone.utc).isoformat()
 
@@ -107,18 +103,24 @@ def _run():
         auctions = client.get_auctions_for_connected_realm(connected_realm_id).get("auctions", [])
         print(f"  fetched {len(auctions)} listings in {time.monotonic() - t0:.2f}s", flush=True)
 
-        t0 = time.monotonic()
         aggregates = _aggregate_by_item(auctions)
         seen_item_ids.update(aggregates.keys())
         rows = _rows_from_aggregates(realm_slug, connected_realm_id, aggregates, fetched_at)
-        print(f"  aggregated to {len(rows)} items in {time.monotonic() - t0:.2f}s", flush=True)
+        insert_item_snapshots(conn, rows)
 
-        t0 = time.monotonic()
-        insert_item_snapshots(db, rows)
-        print(f"  wrote {len(rows)} rows to DB in {time.monotonic() - t0:.2f}s", flush=True)
+    sync_item_metadata(client, conn, seen_item_ids)
 
-    sync_item_metadata(client, db, seen_item_ids)
-    db.close()
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=config.retention_days)).isoformat()
+    pruned = prune_snapshots(conn, cutoff)
+    print(f"pruned {pruned} rows older than {config.retention_days} days", flush=True)
+
+    t0 = time.monotonic()
+    publish(conn, storage, fetched_at)
+    print(f"  publish took {time.monotonic() - t0:.2f}s", flush=True)
+
+    compact(conn)
+    conn.close()
+    storage.upload_db(db_path)
 
 
 if __name__ == "__main__":

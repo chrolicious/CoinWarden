@@ -1,11 +1,30 @@
 import argparse
+import sqlite3
 from datetime import datetime, timedelta, timezone
 
 from core.config import Config
-from core.db import get_client
+from core.db import open_db
 
 AH_CUT = 0.05
 COPPER_PER_GOLD = 10_000
+
+
+def _rows(conn: sqlite3.Connection, sql: str, params: list) -> list[dict]:
+    cur = conn.execute(sql, params)
+    cols = [c[0] for c in cur.description]
+    return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+def ensure_latest_snapshot(conn: sqlite3.Connection) -> None:
+    """Materialise the newest snapshot once; the scoring CTEs read it several
+    times and SQLite would otherwise re-scan the whole table for each."""
+    conn.executescript("""
+        DROP TABLE IF EXISTS temp.latest_snapshot;
+        CREATE TEMP TABLE latest_snapshot AS
+            SELECT * FROM item_price_snapshots
+            WHERE fetched_at = (SELECT MAX(fetched_at) FROM item_price_snapshots);
+        CREATE INDEX temp.idx_latest_item ON latest_snapshot (item_id);
+    """)
 
 # Cross-realm spread on the latest snapshot. Buy at the cheapest listing on the
 # cheapest realm; sell by undercutting the cheapest listing on the best other
@@ -16,9 +35,7 @@ COPPER_PER_GOLD = 10_000
 # Params: min_sell_listings, sanity_multiple, max_buy_copper, min_profit_copper, min_roi, max_roi, limit
 CROSS_REALM_SPREAD_SQL = f"""
 WITH latest AS (
-    SELECT *
-    FROM item_price_snapshots
-    WHERE fetched_at = (SELECT MAX(fetched_at) FROM item_price_snapshots)
+    SELECT * FROM latest_snapshot
 ),
 anchor AS (
     SELECT item_id, min_unit_price AS anchor_price, n AS realm_count
@@ -70,14 +87,12 @@ LIMIT ?
 """
 
 
-def cross_realm_spreads(db, min_sell_listings: int, sanity_multiple: float, max_buy_gold: int,
-                        min_profit_gold: int, min_roi: float, max_roi: float, limit: int) -> list[tuple]:
-    result = db.execute(
-        CROSS_REALM_SPREAD_SQL,
-        [min_sell_listings, sanity_multiple, max_buy_gold * COPPER_PER_GOLD,
-         min_profit_gold * COPPER_PER_GOLD, min_roi, max_roi, limit],
-    )
-    return list(result.rows)
+def cross_realm_spreads(conn, min_sell_listings: int, sanity_multiple: float, max_buy_gold: int,
+                        min_profit_gold: int, min_roi: float, max_roi: float, limit: int) -> list[dict]:
+    ensure_latest_snapshot(conn)
+    return _rows(conn, CROSS_REALM_SPREAD_SQL,
+                 [min_sell_listings, sanity_multiple, max_buy_gold * COPPER_PER_GOLD,
+                  min_profit_gold * COPPER_PER_GOLD, min_roi, max_roi, limit])
 
 
 # Timing flip on a single realm: current cheapest listing vs the item's own
@@ -111,9 +126,7 @@ stats AS (
     GROUP BY connected_realm_id, item_id
 ),
 latest AS (
-    SELECT *
-    FROM item_price_snapshots
-    WHERE fetched_at = (SELECT MAX(fetched_at) FROM item_price_snapshots)
+    SELECT * FROM latest_snapshot
 ),
 scored AS (
     SELECT l.item_id, l.realm_slug, l.min_unit_price AS buy_price, l.listing_count,
@@ -141,16 +154,46 @@ LIMIT ?
 """
 
 
-def timing_flips(db, window_days: int, min_snapshots: int, min_turnover: int, min_discount: float,
+def timing_flips(conn, window_days: int, min_snapshots: int, min_turnover: int, min_discount: float,
                  max_buy_gold: int, min_profit_gold: int, min_roi: float, max_roi: float,
-                 limit: int) -> list[tuple]:
+                 limit: int) -> list[dict]:
     window_start = (datetime.now(timezone.utc) - timedelta(days=window_days)).isoformat()
-    result = db.execute(
-        TIMING_FLIP_SQL,
-        [window_start, min_snapshots, min_turnover, min_discount, max_buy_gold * COPPER_PER_GOLD,
-         min_profit_gold * COPPER_PER_GOLD, min_roi, max_roi, limit],
-    )
-    return list(result.rows)
+    ensure_latest_snapshot(conn)
+    return _rows(conn, TIMING_FLIP_SQL,
+                 [window_start, min_snapshots, min_turnover, min_discount, max_buy_gold * COPPER_PER_GOLD,
+                  min_profit_gold * COPPER_PER_GOLD, min_roi, max_roi, limit])
+
+
+# Published with permissive filters; the frontend applies the user's own
+# thresholds client-side so tightening them never requires a re-run.
+PUBLISH_SPREADS = dict(min_sell_listings=2, sanity_multiple=6.0, max_buy_gold=2_000_000,
+                       min_profit_gold=100, min_roi=0.1, max_roi=10.0, limit=500)
+PUBLISH_TIMING = dict(window_days=14, min_snapshots=24, min_turnover=1, min_discount=0.15,
+                      max_buy_gold=2_000_000, min_profit_gold=100, min_roi=0.1, max_roi=10.0, limit=500)
+
+ITEM_HISTORY_SQL = """
+SELECT realm_slug, fetched_at, min_unit_price, median_unit_price, listing_count
+FROM item_price_snapshots
+WHERE item_id = ?
+ORDER BY fetched_at
+"""
+
+
+def publish(conn: sqlite3.Connection, storage, fetched_at: str) -> None:
+    spreads = cross_realm_spreads(conn, **PUBLISH_SPREADS)
+    timing = timing_flips(conn, **PUBLISH_TIMING)
+    storage.put_json("latest/spreads.json", {"generated_at": fetched_at, "rows": spreads})
+    storage.put_json("latest/timing.json", {"generated_at": fetched_at, "rows": timing})
+
+    items = _rows(conn, "SELECT item_id, name, quality, item_class, item_subclass, icon_url FROM items", [])
+    storage.put_json("items.json", {"generated_at": fetched_at, "items": items}, cache_seconds=3600)
+
+    featured = {r["item_id"] for r in spreads} | {r["item_id"] for r in timing}
+    for item_id in featured:
+        history = _rows(conn, ITEM_HISTORY_SQL, [item_id])
+        storage.put_json(f"history/{item_id}.json", {"item_id": item_id, "rows": history})
+    print(f"published {len(spreads)} spreads, {len(timing)} timing flips, "
+          f"{len(items)} items, {len(featured)} histories", flush=True)
 
 
 def _gold(copper: int) -> str:
@@ -167,24 +210,24 @@ def _add_risk_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--limit", type=int, default=30)
 
 
-def _print_spreads(rows: list[tuple]) -> None:
+def _print_spreads(rows: list[dict]) -> None:
     print(f"{'item':<42} {'buy':<24} {'sell':<24} {'anchor':>9} {'net':>9} {'roi':>6}")
-    for (item_id, name, quality, cls, subcls, buy_realm, buy_price, buy_n,
-         sell_realm, sell_price, sell_median, sell_n, anchor, realms, net, roi) in rows:
-        label = (name or f"item {item_id}")[:40]
-        buy = f"{buy_realm[:10]} {_gold(buy_price)} x{buy_n}"
-        sell = f"{sell_realm[:10]} {_gold(sell_price)} x{sell_n}"
-        print(f"{label:<42} {buy:<24} {sell:<24} {_gold(anchor):>9} {_gold(net):>9} {roi:>6.0%}")
+    for r in rows:
+        label = (r["name"] or f"item {r['item_id']}")[:40]
+        buy = f"{r['buy_realm'][:10]} {_gold(r['buy_price'])} x{r['buy_listings']}"
+        sell = f"{r['sell_realm'][:10]} {_gold(r['sell_price'])} x{r['sell_listings']}"
+        print(f"{label:<42} {buy:<24} {sell:<24} {_gold(r['anchor_price']):>9} "
+              f"{_gold(r['net_profit']):>9} {r['roi']:>6.0%}")
 
 
-def _print_timing(rows: list[tuple]) -> None:
+def _print_timing(rows: list[dict]) -> None:
     print(f"{'item':<42} {'realm':<11} {'now':>9} {'p25':>9} {'p50':>9} {'p75':>9} "
           f"{'snaps':>5} {'turn':>4} {'disc':>5} {'net':>9} {'roi':>5} {'z':>5}")
-    for (item_id, name, realm, buy_price, n, p25, p50, p75, snaps, turnover,
-         discount, net, roi, z) in rows:
-        label = (name or f"item {item_id}")[:40]
-        print(f"{label:<42} {realm[:10]:<11} {_gold(buy_price):>9} {_gold(p25):>9} {_gold(p50):>9} "
-              f"{_gold(p75):>9} {snaps:>5} {turnover:>4} {discount:>5.0%} {_gold(net):>9} {roi:>5.0%} {z:>5}")
+    for r in rows:
+        label = (r["name"] or f"item {r['item_id']}")[:40]
+        print(f"{label:<42} {r['realm_slug'][:10]:<11} {_gold(r['buy_price']):>9} {_gold(r['p25']):>9} "
+              f"{_gold(r['p50']):>9} {_gold(r['p75']):>9} {r['snapshots']:>5} {r['turnover_events']:>4} "
+              f"{r['discount']:>5.0%} {_gold(r['net_profit']):>9} {r['roi']:>5.0%} {r['zscore']:>5}")
 
 
 def main():
@@ -207,16 +250,17 @@ def main():
     _add_risk_args(tp)
 
     args = parser.parse_args()
-    db = get_client(Config())
+    config = Config()
+    conn = open_db(config.data_dir / "coinwarden.sqlite")
     if args.command == "spreads":
-        rows = cross_realm_spreads(db, args.min_sell_listings, args.sanity_multiple, args.max_buy,
+        rows = cross_realm_spreads(conn, args.min_sell_listings, args.sanity_multiple, args.max_buy,
                                    args.min_profit, args.min_roi, args.max_roi, args.limit)
         _print_spreads(rows)
     else:
-        rows = timing_flips(db, args.window_days, args.min_snapshots, args.min_turnover, args.min_discount,
+        rows = timing_flips(conn, args.window_days, args.min_snapshots, args.min_turnover, args.min_discount,
                             args.max_buy, args.min_profit, args.min_roi, args.max_roi, args.limit)
         _print_timing(rows)
-    db.close()
+    conn.close()
 
 
 if __name__ == "__main__":

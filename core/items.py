@@ -46,7 +46,5 @@ def sync_item_metadata(client: BattleNetClient, db, seen_item_ids: set[int]) -> 
         rows = list(pool.map(lambda item_id: _fetch_one(client, item_id, fetched_at), to_fetch))
     print(f"  fetched {len(rows)} item records in {time.monotonic() - t0:.2f}s", flush=True)
 
-    t0 = time.monotonic()
     upsert_items(db, rows)
-    print(f"  wrote {len(rows)} items in {time.monotonic() - t0:.2f}s "
-          f"({len(missing) - len(to_fetch)} still pending for next run)", flush=True)
+    print(f"  wrote {len(rows)} items ({len(missing) - len(to_fetch)} still pending for next run)", flush=True)

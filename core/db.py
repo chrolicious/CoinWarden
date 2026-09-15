@@ -1,12 +1,9 @@
+import sqlite3
 import time
-
-import libsql_client
-
-from core.config import Config
+from pathlib import Path
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS item_price_snapshots (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
     realm_slug TEXT NOT NULL,
     connected_realm_id INTEGER NOT NULL,
     item_id INTEGER NOT NULL,
@@ -14,14 +11,15 @@ CREATE TABLE IF NOT EXISTS item_price_snapshots (
     median_unit_price INTEGER NOT NULL,
     listing_count INTEGER NOT NULL,
     total_quantity INTEGER NOT NULL,
-    fetched_at TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_item_snapshots_lookup
-    ON item_price_snapshots (connected_realm_id, item_id, fetched_at);
+    fetched_at TEXT NOT NULL,
+    PRIMARY KEY (connected_realm_id, item_id, fetched_at)
+) WITHOUT ROWID;
 
 CREATE INDEX IF NOT EXISTS idx_item_snapshots_fetched_at
     ON item_price_snapshots (fetched_at);
+
+CREATE INDEX IF NOT EXISTS idx_item_snapshots_item
+    ON item_price_snapshots (item_id, fetched_at);
 
 CREATE TABLE IF NOT EXISTS items (
     item_id INTEGER PRIMARY KEY,
@@ -35,85 +33,70 @@ CREATE TABLE IF NOT EXISTS items (
     icon_url TEXT,
     fetched_at TEXT NOT NULL
 );
-
-DROP TABLE IF EXISTS auction_snapshots;
 """
 
 
-def get_client(config: Config) -> libsql_client.Client:
-    url = config.turso_database_url.replace("libsql://", "https://", 1)
-    return libsql_client.create_client_sync(
-        url=url,
-        auth_token=config.turso_auth_token,
-    )
+def open_db(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.executescript(SCHEMA)
+    return conn
 
 
-def ensure_schema(client: libsql_client.Client) -> None:
-    for statement in SCHEMA.strip().split(";"):
-        statement = statement.strip()
-        if statement:
-            client.execute(statement)
-
-
-# Runner-to-Turso latency dominates write time, so minimise HTTP round trips:
-# many rows per INSERT statement, many statements per batch request.
-ROWS_PER_STATEMENT = 250
-STATEMENTS_PER_BATCH = 20
-
-SNAPSHOT_COLUMNS = 8
-
-
-def _multi_row_insert(rows: list[tuple]) -> libsql_client.Statement:
-    placeholders = ", ".join(["(" + ", ".join(["?"] * SNAPSHOT_COLUMNS) + ")"] * len(rows))
-    sql = (
-        "INSERT INTO item_price_snapshots "
-        "(realm_slug, connected_realm_id, item_id, min_unit_price, median_unit_price, "
-        "listing_count, total_quantity, fetched_at) VALUES " + placeholders
-    )
-    args = [value for row in rows for value in row]
-    return libsql_client.Statement(sql, args)
-
-
-def insert_item_snapshots(client: libsql_client.Client, rows: list[tuple]) -> None:
+def insert_item_snapshots(conn: sqlite3.Connection, rows: list[tuple]) -> None:
     if not rows:
         return
-
-    statements = [
-        _multi_row_insert(rows[i : i + ROWS_PER_STATEMENT])
-        for i in range(0, len(rows), ROWS_PER_STATEMENT)
-    ]
-
-    total_batches = (len(statements) + STATEMENTS_PER_BATCH - 1) // STATEMENTS_PER_BATCH
-    for batch_num, i in enumerate(range(0, len(statements), STATEMENTS_PER_BATCH), start=1):
-        t0 = time.monotonic()
-        client.batch(statements[i : i + STATEMENTS_PER_BATCH])
-        print(f"    batch {batch_num}/{total_batches} in {time.monotonic() - t0:.2f}s", flush=True)
-
-
-def get_known_item_ids(client: libsql_client.Client) -> set[int]:
-    result = client.execute("SELECT item_id FROM items")
-    return {row[0] for row in result.rows}
+    t0 = time.monotonic()
+    with conn:
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO item_price_snapshots
+                (realm_slug, connected_realm_id, item_id, min_unit_price, median_unit_price,
+                 listing_count, total_quantity, fetched_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+    print(f"  wrote {len(rows)} rows in {time.monotonic() - t0:.2f}s", flush=True)
 
 
-def upsert_items(client: libsql_client.Client, rows: list[tuple]) -> None:
+def prune_snapshots(conn: sqlite3.Connection, cutoff_iso: str) -> int:
+    with conn:
+        cur = conn.execute("DELETE FROM item_price_snapshots WHERE fetched_at < ?", (cutoff_iso,))
+    return cur.rowcount
+
+
+def get_known_item_ids(conn: sqlite3.Connection) -> set[int]:
+    return {row[0] for row in conn.execute("SELECT item_id FROM items")}
+
+
+def upsert_items(conn: sqlite3.Connection, rows: list[tuple]) -> None:
     if not rows:
         return
+    with conn:
+        conn.executemany(
+            """
+            INSERT INTO items
+                (item_id, name, quality, item_class, item_subclass, inventory_type,
+                 item_level, vendor_sell_price, icon_url, fetched_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(item_id) DO UPDATE SET
+                name = excluded.name,
+                quality = excluded.quality,
+                item_class = excluded.item_class,
+                item_subclass = excluded.item_subclass,
+                inventory_type = excluded.inventory_type,
+                item_level = excluded.item_level,
+                vendor_sell_price = excluded.vendor_sell_price,
+                icon_url = excluded.icon_url,
+                fetched_at = excluded.fetched_at
+            """,
+            rows,
+        )
 
-    statement = """
-        INSERT INTO items
-            (item_id, name, quality, item_class, item_subclass, inventory_type, item_level, vendor_sell_price, icon_url, fetched_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(item_id) DO UPDATE SET
-            name = excluded.name,
-            quality = excluded.quality,
-            item_class = excluded.item_class,
-            item_subclass = excluded.item_subclass,
-            inventory_type = excluded.inventory_type,
-            item_level = excluded.item_level,
-            vendor_sell_price = excluded.vendor_sell_price,
-            icon_url = excluded.icon_url,
-            fetched_at = excluded.fetched_at
-    """
-    batch = [libsql_client.Statement(statement, row) for row in rows]
-    for i in range(0, len(batch), 500):
-        client.batch(batch[i : i + 500])
+
+def compact(conn: sqlite3.Connection) -> None:
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    conn.execute("VACUUM")

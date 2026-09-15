@@ -1,4 +1,6 @@
 import os
+from pathlib import Path
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -13,5 +15,15 @@ class Config:
         for slug in os.environ["WOW_REALM_SLUGS"].split(",")
         if slug.strip()
     ]
-    turso_database_url = os.environ["TURSO_DATABASE_URL"]
-    turso_auth_token = os.environ["TURSO_AUTH_TOKEN"]
+
+    r2_account_id = os.environ.get("R2_ACCOUNT_ID")
+    r2_access_key_id = os.environ.get("R2_ACCESS_KEY_ID")
+    r2_secret_access_key = os.environ.get("R2_SECRET_ACCESS_KEY")
+    r2_bucket = os.environ.get("R2_BUCKET", "coinwarden")
+
+    data_dir = Path(os.environ.get("COINWARDEN_DATA_DIR", "data"))
+    retention_days = int(os.environ.get("COINWARDEN_RETENTION_DAYS", "14"))
+
+    @property
+    def r2_configured(self) -> bool:
+        return bool(self.r2_account_id and self.r2_access_key_id and self.r2_secret_access_key)
