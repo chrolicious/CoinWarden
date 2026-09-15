@@ -64,7 +64,7 @@ def _rows_from_aggregates(realm_slug: str, connected_realm_id: int, aggregates: 
 
 
 def main():
-    faulthandler.dump_traceback_later(900, exit=True, file=sys.stderr)
+    faulthandler.dump_traceback_later(3300, exit=True, file=sys.stderr)
 
     try:
         _run()

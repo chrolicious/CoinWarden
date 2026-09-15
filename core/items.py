@@ -1,3 +1,4 @@
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -6,8 +7,8 @@ from core.api_client import BattleNetClient
 from core.db import get_known_item_ids, upsert_items
 
 # Blizzard allows 36k requests/hour; each item costs 2 calls. Capped so the
-# initial ~30k-item backfill spreads across hourly runs instead of one burst.
-MAX_NEW_ITEMS_PER_RUN = 1500
+# routine hourly run stays small; a one-off backfill raises it via env.
+MAX_NEW_ITEMS_PER_RUN = int(os.environ.get("COINWARDEN_MAX_NEW_ITEMS", "1500"))
 CONCURRENCY = 16
 
 
@@ -42,9 +43,13 @@ def sync_item_metadata(client: BattleNetClient, db, seen_item_ids: set[int]) -> 
     fetched_at = datetime.now(timezone.utc).isoformat()
 
     t0 = time.monotonic()
+    written = 0
     with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
-        rows = list(pool.map(lambda item_id: _fetch_one(client, item_id, fetched_at), to_fetch))
-    print(f"  fetched {len(rows)} item records in {time.monotonic() - t0:.2f}s", flush=True)
+        for start in range(0, len(to_fetch), 500):
+            chunk = to_fetch[start:start + 500]
+            rows = list(pool.map(lambda item_id: _fetch_one(client, item_id, fetched_at), chunk))
+            upsert_items(db, rows)
+            written += len(rows)
+            print(f"  {written}/{len(to_fetch)} items in {time.monotonic() - t0:.0f}s", flush=True)
 
-    upsert_items(db, rows)
-    print(f"  wrote {len(rows)} items ({len(missing) - len(to_fetch)} still pending for next run)", flush=True)
+    print(f"  wrote {written} items ({len(missing) - len(to_fetch)} still pending for next run)", flush=True)

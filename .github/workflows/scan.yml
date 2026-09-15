@@ -3,7 +3,12 @@ name: Hourly AH scan
 on:
   schedule:
     - cron: "5 * * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      max_new_items:
+        description: "Max item metadata records to fetch this run (raise for a one-off backfill)"
+        default: "1500"
+        required: false
 
 concurrency:
   group: scan
@@ -12,7 +17,7 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 55
     steps:
       - uses: actions/checkout@v4
 
@@ -26,6 +31,7 @@ jobs:
       - run: python -m core.main
         env:
           PYTHONUNBUFFERED: "1"
+          COINWARDEN_MAX_NEW_ITEMS: ${{ inputs.max_new_items || '1500' }}
           BNET_CLIENT_ID: ${{ secrets.BNET_CLIENT_ID }}
           BNET_CLIENT_SECRET: ${{ secrets.BNET_CLIENT_SECRET }}
           BNET_REGION: eu
