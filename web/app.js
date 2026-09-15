@@ -14,7 +14,7 @@ const state = {
   favorites: new Set(loadJSON("cw.favorites", [])),
   filters: Object.assign({
     maxBuy: 100000, minProfit: 500, minRoi: 20, maxRoi: 400, minSellListings: 3,
-    quality: "", search: "", namedOnly: false,
+    quality: "", itemClass: "", itemSubclass: "", slot: "", search: "", namedOnly: false,
   }, loadJSON("cw.filters", {})),
   sort: { spreads: ["net_profit", -1], timing: ["net_profit", -1], favorites: ["name", 1] },
   detail: null,
@@ -59,13 +59,21 @@ function ago(iso) {
 }
 function itemInfo(itemId, row) {
   const i = state.items.get(itemId) || {};
+  const itemClass = i.item_class || row?.item_class || "";
+  const itemSubclass = i.item_subclass || row?.item_subclass || "";
   return {
     name: i.name || row?.name || `Item ${itemId}`,
     quality: i.quality || row?.quality || "",
-    cls: [i.item_class || row?.item_class, i.item_subclass || row?.item_subclass].filter(Boolean).join(" · "),
+    itemClass, itemSubclass,
+    slot: i.inventory_type || "",
+    level: i.item_level || null,
+    cls: [itemClass, itemSubclass].filter(Boolean).join(" · "),
     icon: i.icon_url || "",
     named: Boolean(i.name || row?.name),
   };
+}
+function slotLabel(slot) {
+  return slot.toLowerCase().replace(/_/g, " ").replace("non equip", "not equippable");
 }
 
 // ---------- data ----------
@@ -95,6 +103,9 @@ function applyFilters(rows, kind) {
     if (f.namedOnly && !info.named) return false;
     if (q && !info.name.toLowerCase().includes(q)) return false;
     if (f.quality && info.quality !== f.quality) return false;
+    if (f.itemClass && info.itemClass !== f.itemClass) return false;
+    if (f.itemSubclass && info.itemSubclass !== f.itemSubclass) return false;
+    if (f.slot && info.slot !== f.slot) return false;
     if (r.buy_price > f.maxBuy * COPPER) return false;
     if (r.net_profit < f.minProfit * COPPER) return false;
     if (r.roi * 100 < f.minRoi || r.roi * 100 > f.maxRoi) return false;
@@ -112,21 +123,38 @@ function sortRows(rows, [key, dir]) {
     return (av < bv ? -1 : 1) * dir;
   });
 }
-function filterBar(kind) {
+function filterBar(kind, source) {
   const f = state.filters;
+  const set = (key, value) => { f[key] = value; saveJSON("cw.filters", f); render(); };
   const num = (label, key, opts = {}) => el("label", {}, label,
-    el("input", { type: "number", value: f[key], min: 0, step: opts.step || 1, oninput: (e) => { f[key] = Number(e.target.value) || 0; saveJSON("cw.filters", f); render(); } }));
+    el("input", { type: "number", value: f[key], min: 0, step: opts.step || 1, oninput: (e) => set(key, Number(e.target.value) || 0) }));
+  const select = (label, key, values, format = (v) => v) => el("label", {}, label,
+    el("select", { onchange: (e) => set(key, e.target.value) },
+      el("option", { value: "" }, "any"),
+      ...values.map((v) => el("option", { value: v, selected: f[key] === v ? "" : null }, format(v)))));
+
+  // Option lists come from the items actually present in this list, so the
+  // dropdowns never offer a choice that yields nothing.
+  const infos = source.map((r) => itemInfo(r.item_id, r));
+  const uniq = (xs) => [...new Set(xs.filter(Boolean))].sort();
+  const classes = uniq(infos.map((i) => i.itemClass));
+  const subclasses = uniq(infos.filter((i) => !f.itemClass || i.itemClass === f.itemClass).map((i) => i.itemSubclass));
+  const slots = uniq(infos.filter((i) => !f.itemClass || i.itemClass === f.itemClass).map((i) => i.slot));
+  if (f.itemSubclass && !subclasses.includes(f.itemSubclass)) f.itemSubclass = "";
+
   return el("div", { class: "filters" },
-    el("label", {}, "Search", el("input", { class: "wide", type: "search", value: f.search, placeholder: "item name", oninput: (e) => { f.search = e.target.value; saveJSON("cw.filters", f); render(); } })),
+    el("label", {}, "Search", el("input", { class: "wide", type: "search", value: f.search, placeholder: "item name", oninput: (e) => set("search", e.target.value) })),
+    select("Type", "itemClass", classes),
+    select("Subtype", "itemSubclass", subclasses),
+    select("Slot", "slot", slots, slotLabel),
+    select("Quality", "quality", QUALITY_ORDER.filter((q) => infos.some((i) => i.quality === q)), (q) => q.toLowerCase()),
     num("Max buy (g)", "maxBuy", { step: 1000 }),
     num("Min net profit (g)", "minProfit", { step: 100 }),
     num("Min ROI %", "minRoi", { step: 5 }),
     num("Max ROI %", "maxRoi", { step: 5 }),
     kind === "spreads" ? num("Min sell listings", "minSellListings") : null,
-    el("label", {}, "Quality", el("select", { onchange: (e) => { f.quality = e.target.value; saveJSON("cw.filters", f); render(); } },
-      el("option", { value: "" }, "any"),
-      ...QUALITY_ORDER.map((q) => el("option", { value: q, selected: f.quality === q ? "" : null }, q.toLowerCase())))),
-    el("label", { class: "check" }, el("input", { type: "checkbox", checked: f.namedOnly ? "" : null, onchange: (e) => { f.namedOnly = e.target.checked; saveJSON("cw.filters", f); render(); } }), "named items only"),
+    el("label", { class: "check" }, el("input", { type: "checkbox", checked: f.namedOnly ? "" : null, onchange: (e) => set("namedOnly", e.target.checked) }), "named items only"),
+    el("button", { class: "reset", onclick: () => { for (const k of ["quality", "itemClass", "itemSubclass", "slot", "search"]) f[k] = ""; saveJSON("cw.filters", f); render(); } }, "clear"),
   );
 }
 
@@ -145,7 +173,8 @@ function itemCell(itemId, row) {
   const info = itemInfo(itemId, row);
   return el("td", { class: "item left" },
     info.icon ? el("img", { src: info.icon, alt: "", loading: "lazy" }) : el("span", { style: "width:24px;height:24px" }),
-    el("div", {}, el("div", { class: "name" }, info.name), el("div", { class: "sub" }, [info.quality.toLowerCase(), info.cls].filter(Boolean).join(" · "))));
+    el("div", {}, el("div", { class: "name" }, info.name), el("div", { class: "sub" },
+      [info.quality.toLowerCase(), info.cls, info.slot ? slotLabel(info.slot) : "", info.level ? `ilvl ${info.level}` : ""].filter(Boolean).join(" · "))));
 }
 function realmCell(realm, price, listings) {
   return el("td", {}, el("div", {}, el("span", { class: "dot", style: `background:${REALM_COLOR[realm] || "var(--muted)"}` }), goldFull(price)),
@@ -211,7 +240,7 @@ function renderList() {
   const kind = state.tab;
   const source = kind === "spreads" ? state.spreads : state.timing;
   const rows = applyFilters(source, kind);
-  app.append(filterBar(kind));
+  app.append(filterBar(kind, source));
   app.append(el("p", { class: "count" }, `${rows.length} of ${source.length} shown`));
   if (kind === "timing" && !source.length) {
     app.append(el("div", { class: "card" }, el("div", { class: "empty" }, "No timing flips yet — this needs a day or two of hourly history before dips are measurable.")));

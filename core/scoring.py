@@ -167,9 +167,9 @@ def timing_flips(conn, window_days: int, min_snapshots: int, min_turnover: int, 
 # Published with permissive filters; the frontend applies the user's own
 # thresholds client-side so tightening them never requires a re-run.
 PUBLISH_SPREADS = dict(min_sell_listings=2, sanity_multiple=6.0, max_buy_gold=2_000_000,
-                       min_profit_gold=100, min_roi=0.1, max_roi=10.0, limit=500)
+                       min_profit_gold=100, min_roi=0.1, max_roi=10.0, limit=5000)
 PUBLISH_TIMING = dict(window_days=14, min_snapshots=24, min_turnover=1, min_discount=0.15,
-                      max_buy_gold=2_000_000, min_profit_gold=100, min_roi=0.1, max_roi=10.0, limit=500)
+                      max_buy_gold=2_000_000, min_profit_gold=100, min_roi=0.1, max_roi=10.0, limit=5000)
 
 # Histories are published in shards (item_id % HISTORY_SHARDS) for every item
 # featured in the last FEATURED_RETENTION_DAYS, so an item that drops out of
@@ -193,7 +193,8 @@ def publish(conn: sqlite3.Connection, storage, fetched_at: str) -> None:
     storage.put_json("latest/spreads.json", {"generated_at": fetched_at, "rows": spreads})
     storage.put_json("latest/timing.json", {"generated_at": fetched_at, "rows": timing})
 
-    items = _rows(conn, "SELECT item_id, name, quality, item_class, item_subclass, icon_url FROM items", [])
+    items = _rows(conn, "SELECT item_id, name, quality, item_class, item_subclass, inventory_type, item_level, icon_url "
+                        "FROM items WHERE name IS NOT NULL", [])
     storage.put_json("items.json", {"generated_at": fetched_at, "items": items}, cache_seconds=3600)
 
     featured = {r["item_id"] for r in spreads} | {r["item_id"] for r in timing}
