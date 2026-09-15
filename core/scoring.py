@@ -207,14 +207,16 @@ def publish(conn: sqlite3.Connection, storage, fetched_at: str) -> None:
     retention_start = (datetime.now(timezone.utc) - timedelta(days=FEATURED_RETENTION_DAYS)).isoformat()
 
     published_items = 0
+    shard_files = []
     for shard in range(HISTORY_SHARDS):
         rows = _rows(conn, ITEM_HISTORY_SQL, [retention_start, HISTORY_SHARDS, shard])
         by_item: dict[int, list] = {}
         for r in rows:
             by_item.setdefault(r.pop("item_id"), []).append(r)
         published_items += len(by_item)
-        storage.put_json(f"history/{shard}.json", {"generated_at": fetched_at, "shards": HISTORY_SHARDS,
-                                                    "items": {str(k): v for k, v in by_item.items()}})
+        shard_files.append((f"history/{shard}.json", {"generated_at": fetched_at, "shards": HISTORY_SHARDS,
+                                                       "items": {str(k): v for k, v in by_item.items()}}))
+    storage.put_json_many(shard_files)
     print(f"published {len(spreads)} spreads, {len(timing)} timing flips, {len(items)} items, "
           f"{published_items} item histories in {HISTORY_SHARDS} shards", flush=True)
 

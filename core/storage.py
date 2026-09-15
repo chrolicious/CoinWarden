@@ -1,6 +1,7 @@
 import gzip
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import boto3
@@ -60,6 +61,10 @@ class R2Storage:
             CacheControl=f"public, max-age={cache_seconds}",
         )
 
+    def put_json_many(self, entries: list[tuple[str, object]], cache_seconds: int = 300) -> None:
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            list(pool.map(lambda e: self.put_json(e[0], e[1], cache_seconds), entries))
+
 
 class LocalStorage:
     """Drop-in for R2Storage when no R2 credentials are present: keeps the DB
@@ -78,6 +83,10 @@ class LocalStorage:
         path = self.root / key
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, separators=(",", ":")))
+
+    def put_json_many(self, entries: list[tuple[str, object]], cache_seconds: int = 300) -> None:
+        for key, payload in entries:
+            self.put_json(key, payload, cache_seconds)
 
 
 def get_storage(config: Config):
