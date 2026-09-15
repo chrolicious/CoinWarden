@@ -175,7 +175,7 @@ PUBLISH_TIMING = dict(window_days=14, min_snapshots=24, min_turnover=1, min_disc
 # featured in the last FEATURED_RETENTION_DAYS, so an item that drops out of
 # the lists - or a favorite - keeps a fresh chart without publishing all ~18k
 # items every hour (R2 write operations are the scarce free-tier resource).
-HISTORY_SHARDS = 64
+HISTORY_SHARDS = 256
 FEATURED_RETENTION_DAYS = 7
 
 ITEM_HISTORY_SQL = """

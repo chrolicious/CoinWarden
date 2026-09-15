@@ -249,7 +249,7 @@ function renderList() {
   app.append(table(kind, rows, kind === "spreads" ? SPREAD_COLS : TIMING_COLS));
 }
 
-const HISTORY_SHARDS = 64;
+const HISTORY_SHARDS = 256;
 async function openDetail(itemId) {
   location.hash = `item/${itemId}`;
   state.detail = { itemId, history: null };
