@@ -1,0 +1,11 @@
+name = "coinwarden"
+main = "worker/index.js"
+compatibility_date = "2026-09-01"
+
+[assets]
+directory = "web"
+binding = "ASSETS"
+
+[[r2_buckets]]
+binding = "DATA"
+bucket_name = "coinwarden"
