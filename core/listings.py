@@ -9,11 +9,18 @@ real sales, but counting them would inflate velocity for dead items.
 """
 import sqlite3
 import time
+from datetime import datetime
 
 # Listings below this are junk for a gold-making tool and dominate the counts.
 MIN_TRACKED_UNIT_PRICE = 100 * 10_000
 
-SAFE_BUCKETS = ("LONG", "VERY_LONG")
+# Minimum time a listing in each bucket still had when last seen. A vanish can
+# only be called a sale if the gap since it was last seen is shorter than that.
+MIN_REMAINING_HOURS = {"VERY_LONG": 12.0, "LONG": 2.0}
+
+
+def _hours_between(a_iso: str, b_iso: str) -> float:
+    return (datetime.fromisoformat(b_iso) - datetime.fromisoformat(a_iso)).total_seconds() / 3600
 
 
 def _listing_rows(realm_slug: str, connected_realm_id: int, auctions: list[dict], variant_of, fetched_at: str) -> dict[int, tuple]:
@@ -37,7 +44,7 @@ def diff_and_store(conn: sqlite3.Connection, realm_slug: str, connected_realm_id
 
     previous = {
         row[0]: row for row in conn.execute(
-            "SELECT auction_id, item_id, variant, unit_price, quantity, time_left, first_seen "
+            "SELECT auction_id, item_id, variant, unit_price, quantity, time_left, first_seen, last_seen "
             "FROM active_listings WHERE connected_realm_id = ?", (connected_realm_id,))
     }
     first_run = not previous
@@ -49,10 +56,11 @@ def diff_and_store(conn: sqlite3.Connection, realm_slug: str, connected_realm_id
             new_by_variant.setdefault((row[3], row[4]), []).append(row[5])
 
     events = []
-    for auction_id, (_, item_id, variant, unit_price, quantity, time_left, first_seen) in previous.items():
+    for auction_id, (_, item_id, variant, unit_price, quantity, time_left, first_seen, last_seen) in previous.items():
         if auction_id in current:
             continue
-        if time_left in SAFE_BUCKETS:
+        min_remaining = MIN_REMAINING_HOURS.get(time_left)
+        if min_remaining is not None and _hours_between(last_seen, fetched_at) < min_remaining:
             undercut = any(p < unit_price for p in new_by_variant.get((item_id, variant), ()))
             kind = "relist" if undercut else "sold"
         else:

@@ -2,7 +2,11 @@ name: Hourly AH scan
 
 on:
   schedule:
+    # Primary slot plus a hedge: GitHub drops scheduled runs under load, and a
+    # gap of more than two hours between snapshots breaks sale detection. The
+    # hedge exits within seconds if a run already succeeded recently.
     - cron: "5 * * * *"
+    - cron: "35 * * * *"
   workflow_dispatch:
     inputs:
       max_new_items:
@@ -19,16 +23,34 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 55
     steps:
+      - name: Skip if a run succeeded in the last 50 minutes
+        id: recent
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          last=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow scan.yml --status success --limit 1 \
+                 --json updatedAt -q '.[0].updatedAt')
+          if [ -n "$last" ]; then
+            age=$(( $(date +%s) - $(date -d "$last" +%s) ))
+            echo "last success ${age}s ago"
+            if [ "$age" -lt 3000 ]; then echo "skip=true" >> "$GITHUB_OUTPUT"; fi
+          fi
+
       - uses: actions/checkout@v4
+        if: steps.recent.outputs.skip != 'true'
 
       - uses: actions/setup-python@v5
+        if: steps.recent.outputs.skip != 'true'
         with:
           python-version: "3.11"
           cache: pip
 
       - run: pip install -r requirements.txt
+        if: steps.recent.outputs.skip != 'true'
 
       - run: python -m core.main
+        if: steps.recent.outputs.skip != 'true'
         env:
           PYTHONUNBUFFERED: "1"
           COINWARDEN_MAX_NEW_ITEMS: ${{ inputs.max_new_items || '1500' }}

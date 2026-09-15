@@ -2,6 +2,9 @@ name = "coinwarden"
 main = "worker/index.js"
 compatibility_date = "2026-09-01"
 
+[triggers]
+crons = ["3 * * * *"]
+
 [assets]
 directory = "web"
 binding = "ASSETS"

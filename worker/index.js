@@ -1,6 +1,31 @@
-const ALLOWED_PREFIXES = ["latest/", "history/", "items.json"];
+const ALLOWED_PREFIXES = ["latest/", "history/", "items.json", "bonuses.json"];
+
+// GitHub drops scheduled workflow runs under load; Cloudflare cron triggers
+// are dependable, so the Worker dispatches the scan every hour. The workflow
+// itself skips if another run succeeded in the last 50 minutes.
+async function dispatchScan(env) {
+  if (!env.GITHUB_DISPATCH_TOKEN) {
+    console.log("no GITHUB_DISPATCH_TOKEN secret; skipping dispatch");
+    return;
+  }
+  const resp = await fetch("https://api.github.com/repos/chrolicious/CoinWarden/actions/workflows/scan.yml/dispatches", {
+    method: "POST",
+    headers: {
+      "authorization": `Bearer ${env.GITHUB_DISPATCH_TOKEN}`,
+      "accept": "application/vnd.github+json",
+      "user-agent": "coinwarden-worker",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ ref: "master" }),
+  });
+  console.log(`dispatch: ${resp.status}`);
+}
 
 export default {
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(dispatchScan(env));
+  },
+
   async fetch(request, env) {
     const url = new URL(request.url);
     if (!url.pathname.startsWith("/data/")) {
