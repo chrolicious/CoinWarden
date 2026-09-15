@@ -10,7 +10,7 @@ const QUALITY_ORDER = ["POOR", "COMMON", "UNCOMMON", "RARE", "EPIC", "LEGENDARY"
 const STAT_NAMES = { 32: "Crit", 36: "Haste", 40: "Vers", 49: "Mastery" };
 
 const state = {
-  tab: "spreads",
+  tab: "dashboard",
   spreads: null,
   timing: null,
   items: new Map(),
@@ -374,11 +374,12 @@ function renderList() {
   const app = document.getElementById("app");
   app.replaceChildren();
   const tabs = el("nav", { class: "tabs", role: "tablist" }, ...[
-    ["spreads", "Cross-realm flips"], ["timing", "Timing flips"], ["favorites", `Favorites (${state.favorites.size})`],
-    ["ledger", "Ledger"], ["holdings", "Holdings & Goal"],
+    ["dashboard", "Dashboard"], ["spreads", "Cross-realm flips"], ["timing", "Timing flips"],
+    ["favorites", `Favorites (${state.favorites.size})`], ["ledger", "Ledger"], ["holdings", "Holdings & Goal"],
   ].map(([id, label]) => el("button", { role: "tab", "aria-selected": String(state.tab === id), onclick: () => { state.tab = id; location.hash = id; render(); } }, label)));
   app.append(tabs);
 
+  if (state.tab === "dashboard") { renderDashboard(app); return; }
   if (state.tab === "ledger") { renderLedger(app); return; }
   if (state.tab === "holdings") { renderHoldings(app); return; }
 
@@ -702,14 +703,9 @@ function estimateLiveValue(item_id, variant) {
   return best;
 }
 
-function renderHoldings(app) {
-  if (state.trades === null || state.networth === null) {
-    app.append(el("div", { class: "card" }, el("div", { class: "empty" }, "loading…")));
-    return;
-  }
-  const hasToken = Boolean(getLedgerToken());
-  const { positions, realized, flagged } = computeLedger(state.trades);
-
+// Shared by the Dashboard and Holdings tabs so both read the same numbers.
+function computeGoalSummary() {
+  const { positions, realized, flagged } = computeLedger(state.trades || []);
   const totalCostBasis = positions.reduce((s, p) => s + p.totalCost, 0);
   let totalLiveValue = 0, positionsWithLivePrice = 0;
   const positionRows = positions.map((p) => {
@@ -717,12 +713,39 @@ function renderHoldings(app) {
     if (live != null) { totalLiveValue += live * p.qty; positionsWithLivePrice++; }
     return { ...p, live };
   }).sort((a, b) => b.totalCost - a.totalCost);
-
-  const liquidGold = state.networth.liquid_gold || 0;
+  const liquidGold = (state.networth && state.networth.liquid_gold) || 0;
   const holdingsValue = totalLiveValue || totalCostBasis; // fall back to cost basis when nothing has a live price
   const netWorth = liquidGold + holdingsValue;
   const goalCopper = GOAL_GOLD * COPPER;
   const progress = Math.min(1, netWorth / goalCopper);
+  const totalRealized = realized.reduce((s, r) => s + r.profit, 0);
+  return { positions: positionRows, realized, flagged, totalCostBasis, totalLiveValue, positionsWithLivePrice,
+    liquidGold, holdingsValue, netWorth, goalCopper, progress, totalRealized };
+}
+
+function goalCard(g) {
+  return el("div", { class: "card goal-card" },
+    el("div", { class: "goal-top" },
+      el("div", {}, el("div", { class: "l" }, "Net worth"), el("div", { class: "v" }, goldFull(g.netWorth))),
+      el("div", {}, el("div", { class: "l" }, "Goal"), el("div", { class: "v" }, goldFull(g.goalCopper))),
+      el("div", {}, el("div", { class: "l" }, "Remaining"), el("div", { class: "v" }, goldFull(Math.max(0, g.goalCopper - g.netWorth)))),
+    ),
+    el("div", { class: "goal-bar" }, el("div", { class: "goal-fill", style: `width:${(g.progress * 100).toFixed(1)}%` })),
+    el("div", { class: "count" },
+      `${goldFull(g.liquidGold)} liquid${state.networth?.updated_at ? ` (updated ${ago(state.networth.updated_at)})` : " (not set)"} `
+      + `+ ${goldFull(g.holdingsValue)} in holdings ${g.totalLiveValue ? `(${g.positionsWithLivePrice}/${g.positions.length} at live price, rest at cost)` : "(cost basis - no live prices found)"}`));
+}
+
+function renderHoldings(app) {
+  if (state.trades === null || state.networth === null) {
+    app.append(el("div", { class: "card" }, el("div", { class: "empty" }, "loading…")));
+    return;
+  }
+  const hasToken = Boolean(getLedgerToken());
+  const g = computeGoalSummary();
+  const { realized, flagged, totalCostBasis } = g;
+  const positionRows = g.positions;
+  const liquidGold = g.liquidGold;
 
   app.append(el("div", { class: "ledger-header" },
     el("p", { class: "count" }, "Computed from the ledger - FIFO cost basis, pooled across characters/realms."),
@@ -735,18 +758,7 @@ function renderHoldings(app) {
     } }, "Update liquid gold") : null,
   ));
 
-  // Goal tracker
-  app.append(el("div", { class: "card goal-card" },
-    el("div", { class: "goal-top" },
-      el("div", {}, el("div", { class: "l" }, "Net worth"), el("div", { class: "v" }, goldFull(netWorth))),
-      el("div", {}, el("div", { class: "l" }, "Goal"), el("div", { class: "v" }, goldFull(goalCopper))),
-      el("div", {}, el("div", { class: "l" }, "Remaining"), el("div", { class: "v" }, goldFull(Math.max(0, goalCopper - netWorth)))),
-    ),
-    el("div", { class: "goal-bar" }, el("div", { class: "goal-fill", style: `width:${(progress * 100).toFixed(1)}%` })),
-    el("div", { class: "count" },
-      `${goldFull(liquidGold)} liquid${state.networth.updated_at ? ` (updated ${ago(state.networth.updated_at)})` : " (not set)"} `
-      + `+ ${goldFull(holdingsValue)} in holdings ${totalLiveValue ? `(${positionsWithLivePrice}/${positions.length} at live price, rest at cost)` : "(cost basis - no live prices found)"}`),
-  ));
+  app.append(goalCard(g));
 
   // Capital-at-risk
   app.append(el("h3", { class: "section-h" }, "Capital at risk (open positions)"));
@@ -773,7 +785,7 @@ function renderHoldings(app) {
 
   // Realized P&L
   app.append(el("h3", { class: "section-h" }, "Realized P&L"));
-  const totalRealized = realized.reduce((s, r) => s + r.profit, 0);
+  const totalRealized = g.totalRealized;
   app.append(el("div", { class: "card goal-card" },
     el("div", { class: "goal-top" },
       el("div", {}, el("div", { class: "l" }, "Total realized"), el("div", { class: `v ${totalRealized >= 0 ? "pos" : "neg"}` }, goldFull(totalRealized))),
@@ -794,6 +806,84 @@ function renderHoldings(app) {
       `${flagged.length} sell${flagged.length > 1 ? "s" : ""} had no matching logged buy for part of the quantity `
       + "(item obtained another way, or logged out of order) - counted as pure profit against zero cost for that portion."));
   }
+}
+
+// ---------- dashboard ----------
+// A compact row for the dashboard's top-opportunities lists - not the full
+// sortable table, just enough to act on or click through to the item page.
+function highlightRow(r, kind) {
+  const info = itemInfo(r.item_id, r);
+  const sellLine = kind === "spread"
+    ? `Buy ${cap(r.buy_realm)} ${goldFull(r.buy_price)} → sell ${cap(r.sell_realm)} @ ${goldFull(r.sold_median_7d)}`
+    : `${cap(r.realm_slug)}: now ${goldFull(r.buy_price)}, normally ${goldFull(r.p50)} (${pct(r.discount)} below)`;
+  return el("div", { class: "hl-row", onclick: () => openDetail(rowKey(r)) },
+    info.icon ? whLink(r.item_id, r.variant, el("img", { src: info.icon, alt: "", loading: "lazy" })) : null,
+    el("div", { class: "hl-body" },
+      el("div", { class: "hl-name" }, whLink(r.item_id, r.variant, info.name)),
+      el("div", { class: "hl-sub" }, sellLine)),
+    el("div", { class: `hl-score ${r.score_per_day > 0 ? "pos" : "neg"}` }, `${goldFull(r.score_per_day)}/d`));
+}
+
+function renderDashboard(app) {
+  if (state.trades === null || state.networth === null) {
+    app.append(el("div", { class: "card" }, el("div", { class: "empty" }, "loading…")));
+    return;
+  }
+  const g = computeGoalSummary();
+
+  app.append(el("h3", { class: "section-h" }, "Goal"));
+  app.append(goalCard(g));
+
+  const topSpreads = sortRows(state.spreads, ["score_per_day", -1]).slice(0, 5);
+  const topTiming = sortRows(state.timing, ["score_per_day", -1]).slice(0, 5);
+  app.append(el("div", { class: "dash-cols" },
+    el("div", {},
+      el("h3", { class: "section-h" }, "Top cross-realm flips right now"),
+      topSpreads.length
+        ? el("div", { class: "card" }, ...topSpreads.map((r) => highlightRow(r, "spread")))
+        : el("div", { class: "card" }, el("div", { class: "empty" }, "Nothing clears the evidence bar yet.")),
+      el("p", { class: "count" }, el("a", { href: "#spreads", onclick: (e) => { e.preventDefault(); state.tab = "spreads"; location.hash = "spreads"; render(); } }, "See full list →"))),
+    el("div", {},
+      el("h3", { class: "section-h" }, "Top timing flips right now"),
+      topTiming.length
+        ? el("div", { class: "card" }, ...topTiming.map((r) => highlightRow(r, "timing")))
+        : el("div", { class: "card" }, el("div", { class: "empty" }, "None yet - needs more price history to detect real dips.")),
+      el("p", { class: "count" }, el("a", { href: "#timing", onclick: (e) => { e.preventDefault(); state.tab = "timing"; location.hash = "timing"; render(); } }, "See full list →"))),
+  ));
+
+  const favActive = [...state.favorites].map((key) => {
+    const spread = sortRows(state.spreads.filter((r) => rowKey(r) === key), ["score_per_day", -1])[0];
+    const timing = sortRows(state.timing.filter((r) => rowKey(r) === key), ["score_per_day", -1])[0];
+    const best = [spread, timing].filter(Boolean).sort((a, b) => b.score_per_day - a.score_per_day)[0];
+    return best ? { ...best, kind: spread === best ? "spread" : "timing" } : null;
+  }).filter(Boolean).sort((a, b) => b.score_per_day - a.score_per_day);
+  if (favActive.length) {
+    app.append(el("h3", { class: "section-h" }, "Your favorites, active right now"));
+    app.append(el("div", { class: "card" }, ...favActive.map((r) => highlightRow(r, r.kind))));
+  }
+
+  app.append(el("div", { class: "dash-cols" },
+    el("div", {},
+      el("h3", { class: "section-h" }, "Capital at risk"),
+      el("div", { class: "card goal-card" }, el("div", { class: "goal-top" },
+        el("div", {}, el("div", { class: "l" }, "Open positions"), el("div", { class: "v" }, g.positions.length)),
+        el("div", {}, el("div", { class: "l" }, "Tied up"), el("div", { class: "v" }, goldFull(g.totalCostBasis))),
+        el("div", {}, el("div", { class: "l" }, "Realized so far"), el("div", { class: `v ${g.totalRealized >= 0 ? "pos" : "neg"}` }, goldFull(g.totalRealized))),
+      )),
+      el("p", { class: "count" }, el("a", { href: "#holdings", onclick: (e) => { e.preventDefault(); state.tab = "holdings"; location.hash = "holdings"; render(); } }, "See holdings & P&L →"))),
+    el("div", {},
+      el("h3", { class: "section-h" }, "Recent activity"),
+      state.trades.length
+        ? el("div", { class: "card table-wrap" }, el("table", {},
+            el("tbody", {}, ...state.trades.slice().sort((a, b) => b.ts.localeCompare(a.ts)).slice(0, 5).map((t) =>
+              el("tr", {},
+                el("td", { class: "left" }, ago(t.ts)),
+                el("td", { class: t.action === "buy" ? "neg" : "pos" }, cap(t.action)),
+                el("td", { class: "left" }, t.item_name),
+                el("td", {}, goldFull(t.unit_price * t.quantity)))))))
+        : el("div", { class: "card" }, el("div", { class: "empty" }, "No trades logged yet.")),
+      el("p", { class: "count" }, el("a", { href: "#ledger", onclick: (e) => { e.preventDefault(); state.tab = "ledger"; location.hash = "ledger"; render(); } }, "Log a trade →"))),
+  ));
 }
 
 // ---------- chart ----------
@@ -950,12 +1040,13 @@ function route() {
     openDetail(key.includes("|") ? key : `${key}|`);
     return;
   }
-  if (["spreads", "timing", "favorites", "ledger", "holdings"].includes(h)) state.tab = h;
-  if ((h === "ledger" || h === "holdings") && state.trades === null) {
+  if (["dashboard", "spreads", "timing", "favorites", "ledger", "holdings"].includes(h)) state.tab = h;
+  else if (!h) state.tab = "dashboard";
+  if ((state.tab === "ledger" || state.tab === "holdings" || state.tab === "dashboard") && state.trades === null) {
     state.trades = []; // avoid re-triggering while the fetch is in flight
     loadTrades().then(render).catch((e) => { state.trades = null; console.error(e); });
   }
-  if (h === "holdings" && state.networth === null) {
+  if ((state.tab === "holdings" || state.tab === "dashboard") && state.networth === null) {
     state.networth = {}; // avoid re-triggering while the fetch is in flight
     loadNetworth().then(render).catch((e) => { state.networth = null; console.error(e); });
   }
