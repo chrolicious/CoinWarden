@@ -171,11 +171,19 @@ PUBLISH_SPREADS = dict(min_sell_listings=2, sanity_multiple=6.0, max_buy_gold=2_
 PUBLISH_TIMING = dict(window_days=14, min_snapshots=24, min_turnover=1, min_discount=0.15,
                       max_buy_gold=2_000_000, min_profit_gold=100, min_roi=0.1, max_roi=10.0, limit=500)
 
+# Histories are published in shards (item_id % HISTORY_SHARDS) for every item
+# featured in the last FEATURED_RETENTION_DAYS, so an item that drops out of
+# the lists - or a favorite - keeps a fresh chart without publishing all ~18k
+# items every hour (R2 write operations are the scarce free-tier resource).
+HISTORY_SHARDS = 64
+FEATURED_RETENTION_DAYS = 7
+
 ITEM_HISTORY_SQL = """
-SELECT realm_slug, fetched_at, min_unit_price, median_unit_price, listing_count
+SELECT item_id, realm_slug, fetched_at, min_unit_price, median_unit_price, listing_count
 FROM item_price_snapshots
-WHERE item_id = ?
-ORDER BY fetched_at
+WHERE item_id IN (SELECT item_id FROM featured_items WHERE last_featured_at >= ?)
+  AND item_id % ? = ?
+ORDER BY item_id, fetched_at
 """
 
 
@@ -189,11 +197,25 @@ def publish(conn: sqlite3.Connection, storage, fetched_at: str) -> None:
     storage.put_json("items.json", {"generated_at": fetched_at, "items": items}, cache_seconds=3600)
 
     featured = {r["item_id"] for r in spreads} | {r["item_id"] for r in timing}
-    for item_id in featured:
-        history = _rows(conn, ITEM_HISTORY_SQL, [item_id])
-        storage.put_json(f"history/{item_id}.json", {"item_id": item_id, "rows": history})
-    print(f"published {len(spreads)} spreads, {len(timing)} timing flips, "
-          f"{len(items)} items, {len(featured)} histories", flush=True)
+    with conn:
+        conn.executemany(
+            "INSERT INTO featured_items (item_id, last_featured_at) VALUES (?, ?) "
+            "ON CONFLICT(item_id) DO UPDATE SET last_featured_at = excluded.last_featured_at",
+            [(item_id, fetched_at) for item_id in featured],
+        )
+    retention_start = (datetime.now(timezone.utc) - timedelta(days=FEATURED_RETENTION_DAYS)).isoformat()
+
+    published_items = 0
+    for shard in range(HISTORY_SHARDS):
+        rows = _rows(conn, ITEM_HISTORY_SQL, [retention_start, HISTORY_SHARDS, shard])
+        by_item: dict[int, list] = {}
+        for r in rows:
+            by_item.setdefault(r.pop("item_id"), []).append(r)
+        published_items += len(by_item)
+        storage.put_json(f"history/{shard}.json", {"generated_at": fetched_at, "shards": HISTORY_SHARDS,
+                                                    "items": {str(k): v for k, v in by_item.items()}})
+    print(f"published {len(spreads)} spreads, {len(timing)} timing flips, {len(items)} items, "
+          f"{published_items} item histories in {HISTORY_SHARDS} shards", flush=True)
 
 
 def _gold(copper: int) -> str:

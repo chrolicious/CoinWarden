@@ -220,13 +220,14 @@ function renderList() {
   app.append(table(kind, rows, kind === "spreads" ? SPREAD_COLS : TIMING_COLS));
 }
 
+const HISTORY_SHARDS = 64;
 async function openDetail(itemId) {
   location.hash = `item/${itemId}`;
   state.detail = { itemId, history: null };
   render();
   try {
-    const h = await fetchJSON(`history/${itemId}.json`);
-    if (state.detail?.itemId === itemId) { state.detail.history = h.rows; render(); }
+    const shard = await fetchJSON(`history/${itemId % HISTORY_SHARDS}.json`);
+    if (state.detail?.itemId === itemId) { state.detail.history = shard.items[String(itemId)] || []; render(); }
   } catch {
     if (state.detail?.itemId === itemId) { state.detail.history = []; render(); }
   }
@@ -258,7 +259,8 @@ function renderDetail() {
       el("div", { class: "v" }, goldFull(r.min_unit_price)),
       el("div", { class: "d" }, `median ${goldFull(r.median_unit_price)} · ${r.listing_count} listed · ${ago(r.fetched_at)}`));
   });
-  app.append(el("div", { class: "grid" }, ...tiles, tiles.length ? null : el("div", { class: "tile" }, el("div", { class: "d" }, "Not currently listed on any tracked realm."))));
+  app.append(el("div", { class: "grid" }, ...tiles, tiles.length ? null : el("div", { class: "tile" }, el("div", { class: "d" },
+    history.length ? "Not currently listed on any tracked realm." : "No published history for this item yet — histories cover items that appeared in the lists within the last 7 days."))));
 
   const spread = sortRows(state.spreads.filter((r) => r.item_id === itemId), ["net_profit", -1])[0];
   if (spread) {

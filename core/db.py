@@ -21,6 +21,11 @@ CREATE INDEX IF NOT EXISTS idx_item_snapshots_fetched_at
 CREATE INDEX IF NOT EXISTS idx_item_snapshots_item
     ON item_price_snapshots (item_id, fetched_at);
 
+CREATE TABLE IF NOT EXISTS featured_items (
+    item_id INTEGER PRIMARY KEY,
+    last_featured_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS items (
     item_id INTEGER PRIMARY KEY,
     name TEXT,

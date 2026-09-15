@@ -20,12 +20,18 @@ export default {
       return new Response("not found", { status: 404 });
     }
 
+    // Objects are stored gzipped; decompress here and let Cloudflare re-encode
+    // for the client, so the browser always receives plain JSON.
     const headers = new Headers();
-    obj.writeHttpMetadata(headers);
+    headers.set("content-type", obj.httpMetadata?.contentType || "application/json");
+    headers.set("cache-control", obj.httpMetadata?.cacheControl || "public, max-age=300");
     headers.set("etag", obj.httpEtag);
-    if (!headers.has("cache-control")) {
-      headers.set("cache-control", "public, max-age=300");
+    if (request.method === "HEAD") {
+      return new Response(null, { headers });
     }
-    return new Response(request.method === "HEAD" ? null : obj.body, { headers });
+    const body = obj.httpMetadata?.contentEncoding === "gzip"
+      ? obj.body.pipeThrough(new DecompressionStream("gzip"))
+      : obj.body;
+    return new Response(body, { headers });
   },
 };
