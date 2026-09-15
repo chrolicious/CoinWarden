@@ -22,6 +22,8 @@ jobs:
   scan:
     runs-on: ubuntu-latest
     timeout-minutes: 55
+    permissions:
+      actions: read
     steps:
       - name: Skip if a run succeeded in the last 50 minutes
         id: recent
