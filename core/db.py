@@ -20,6 +20,9 @@ CREATE TABLE IF NOT EXISTS item_price_snapshots (
 CREATE INDEX IF NOT EXISTS idx_item_snapshots_lookup
     ON item_price_snapshots (connected_realm_id, item_id, fetched_at);
 
+CREATE INDEX IF NOT EXISTS idx_item_snapshots_fetched_at
+    ON item_price_snapshots (fetched_at);
+
 CREATE TABLE IF NOT EXISTS items (
     item_id INTEGER PRIMARY KEY,
     name TEXT,
