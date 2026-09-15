@@ -24,6 +24,9 @@ const state = {
   visible: { spreads: PAGE_SIZE, timing: PAGE_SIZE, favorites: PAGE_SIZE },
   detail: null,
   chart: { range: "7d", measure: "min", hidden: new Set() },
+  trades: null,
+  ledgerForm: Object.assign({ character: "", realm: REALM_ORDER[0], action: "buy", itemQuery: "",
+    selectedItem: null, variant: "", price: "", quantity: 1, notes: "" }, loadJSON("cw.ledgerFormDefaults", {})),
 };
 
 // ---------- utils ----------
@@ -137,6 +140,37 @@ async function fetchJSON(path) {
   const r = await fetch(`data/${path}`, { cache: "no-cache" });
   if (!r.ok) throw new Error(`${path}: ${r.status}`);
   return r.json();
+}
+
+// ---------- ledger ----------
+function getLedgerToken() { try { return localStorage.getItem("cw.ledgerToken") || ""; } catch { return ""; } }
+function setLedgerToken(v) { try { if (v) localStorage.setItem("cw.ledgerToken", v); else localStorage.removeItem("cw.ledgerToken"); } catch {} }
+async function loadTrades() {
+  const r = await fetch("api/ledger", { cache: "no-cache" });
+  if (!r.ok) throw new Error(`ledger: ${r.status}`);
+  const data = await r.json();
+  state.trades = data.trades.sort((a, b) => b.ts.localeCompare(a.ts));
+}
+async function submitTrade(trade) {
+  const token = getLedgerToken();
+  if (!token) throw new Error("No ledger token set. Click “Set ledger token” first.");
+  const r = await fetch("api/ledger", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-ledger-token": token },
+    body: JSON.stringify(trade),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `ledger: ${r.status}`);
+  return data.trade;
+}
+async function deleteTrade(id) {
+  const token = getLedgerToken();
+  if (!token) throw new Error("No ledger token set.");
+  const r = await fetch(`api/ledger/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+    headers: { "x-ledger-token": token },
+  });
+  if (!r.ok) { const data = await r.json().catch(() => ({})); throw new Error(data.error || `ledger: ${r.status}`); }
 }
 async function load() {
   const [spreads, timing, items, bonuses] = await Promise.all([
@@ -305,8 +339,11 @@ function renderList() {
   app.replaceChildren();
   const tabs = el("nav", { class: "tabs", role: "tablist" }, ...[
     ["spreads", "Cross-realm flips"], ["timing", "Timing flips"], ["favorites", `Favorites (${state.favorites.size})`],
+    ["ledger", "Ledger"],
   ].map(([id, label]) => el("button", { role: "tab", "aria-selected": String(state.tab === id), onclick: () => { state.tab = id; location.hash = id; render(); } }, label)));
   app.append(tabs);
+
+  if (state.tab === "ledger") { renderLedger(app); return; }
 
   if (state.tab === "favorites") {
     const rows = [...state.favorites].map((key) => {
@@ -405,6 +442,151 @@ function renderDetail() {
   }
 
   if (hasAny) app.append(chartCard(history));
+}
+
+// ---------- ledger view ----------
+function itemSearchResults(query) {
+  const q = query.trim().toLowerCase();
+  if (q.length < 2) return [];
+  const out = [];
+  for (const it of state.items.values()) {
+    if (it.name && it.name.toLowerCase().includes(q)) {
+      out.push(it);
+      if (out.length >= 8) break;
+    }
+  }
+  return out;
+}
+
+function renderLedgerForm(app) {
+  const f = state.ledgerForm;
+  const persist = () => saveJSON("cw.ledgerFormDefaults", { character: f.character, realm: f.realm });
+  const setField = (key, value) => { f[key] = value; render(); };
+
+  const itemField = el("div", { class: "item-search" },
+    el("label", {}, "Item",
+      el("input", {
+        type: "text", value: f.itemQuery, placeholder: "search item name",
+        oninput: (e) => { f.itemQuery = e.target.value; f.selectedItem = null; render(); },
+      })),
+    f.selectedItem ? el("div", { class: "picked" },
+      f.selectedItem.icon_url ? el("img", { src: f.selectedItem.icon_url, alt: "" }) : null,
+      f.selectedItem.name,
+      el("button", { type: "button", class: "clear-pick", onclick: () => { f.selectedItem = null; f.itemQuery = ""; render(); } }, "×"))
+      : (f.itemQuery.trim().length >= 2 ? el("div", { class: "suggestions" },
+          ...itemSearchResults(f.itemQuery).map((it) => el("div", {
+            class: "suggestion", onclick: () => { f.selectedItem = it; f.itemQuery = it.name; render(); },
+          }, it.icon_url ? el("img", { src: it.icon_url, alt: "" }) : null, it.name)),
+          itemSearchResults(f.itemQuery).length === 0 ? el("div", { class: "suggestion muted" }, "no match") : null)
+        : null));
+
+  const form = el("form", {
+    class: "ledger-form",
+    onsubmit: async (e) => {
+      e.preventDefault();
+      const errBox = document.getElementById("ledger-form-error");
+      errBox.textContent = "";
+      if (!f.selectedItem) { errBox.textContent = "Pick an item from the search results."; return; }
+      const price = Number(f.price);
+      const qty = Number(f.quantity);
+      if (!(price > 0)) { errBox.textContent = "Price must be a positive number of gold."; return; }
+      if (!(qty >= 1)) { errBox.textContent = "Quantity must be at least 1."; return; }
+      try {
+        await submitTrade({
+          character: f.character.trim(), realm: f.realm, action: f.action,
+          item_id: f.selectedItem.item_id, item_name: f.selectedItem.name, variant: f.variant.trim(),
+          unit_price: Math.round(price * COPPER), quantity: Math.round(qty), notes: f.notes.trim(),
+        });
+        f.selectedItem = null; f.itemQuery = ""; f.variant = ""; f.price = ""; f.quantity = 1; f.notes = "";
+        persist();
+        await loadTrades();
+        render();
+      } catch (err) {
+        errBox.textContent = err.message;
+      }
+    },
+  },
+    el("div", { class: "ledger-row" },
+      el("label", {}, "Character", el("input", { type: "text", required: "", value: f.character, maxlength: 64,
+        oninput: (e) => setField("character", e.target.value) })),
+      el("label", {}, "Realm", el("select", { onchange: (e) => setField("realm", e.target.value) },
+        ...REALM_ORDER.map((r) => el("option", { value: r, selected: f.realm === r ? "" : null }, r)))),
+      el("label", {}, "Action", el("select", { onchange: (e) => setField("action", e.target.value) },
+        el("option", { value: "buy", selected: f.action === "buy" ? "" : null }, "buy"),
+        el("option", { value: "sell", selected: f.action === "sell" ? "" : null }, "sell"))),
+    ),
+    itemField,
+    el("div", { class: "ledger-row" },
+      el("label", {}, "Variant (optional)", el("input", { type: "text", value: f.variant, placeholder: "bonus IDs, leave blank for base",
+        oninput: (e) => setField("variant", e.target.value) })),
+      el("label", {}, "Unit price (g)", el("input", { type: "number", min: 0, step: "0.01", required: "", value: f.price,
+        oninput: (e) => setField("price", e.target.value) })),
+      el("label", {}, "Quantity", el("input", { type: "number", min: 1, step: 1, required: "", value: f.quantity,
+        oninput: (e) => setField("quantity", e.target.value) })),
+    ),
+    el("label", { class: "notes" }, "Notes (optional)", el("input", { type: "text", value: f.notes, maxlength: 256,
+      oninput: (e) => setField("notes", e.target.value) })),
+    el("div", { class: "ledger-row" },
+      el("button", { type: "submit", class: "primary" }, `Log ${f.action}`),
+      el("span", { id: "ledger-form-error", class: "form-error" }),
+    ),
+  );
+  app.append(el("div", { class: "card ledger-card" }, form));
+}
+
+function renderLedgerTable(app) {
+  const trades = state.trades || [];
+  if (!trades.length) {
+    app.append(el("div", { class: "card" }, el("div", { class: "empty" }, "No trades logged yet.")));
+    return;
+  }
+  const rows = trades.map((t) => el("tr", {},
+    el("td", { class: "left" }, new Date(t.ts).toLocaleString()),
+    el("td", { class: "left" }, t.character),
+    el("td", { class: "left" }, t.realm),
+    el("td", { class: t.action === "buy" ? "neg" : "pos" }, t.action),
+    el("td", { class: "left" }, t.item_name, t.variant ? el("div", { class: "variant" }, t.variant) : null),
+    el("td", {}, goldFull(t.unit_price)),
+    el("td", {}, t.quantity),
+    el("td", {}, goldFull(t.unit_price * t.quantity)),
+    el("td", { class: "left" }, t.notes),
+    el("td", {}, el("button", {
+      class: "star", title: "Delete",
+      onclick: async () => {
+        if (!confirm(`Delete this ${t.action} of ${t.item_name}?`)) return;
+        try { await deleteTrade(t.id); await loadTrades(); render(); }
+        catch (err) { alert(err.message); }
+      },
+    }, "🗑")),
+  ));
+  app.append(el("div", { class: "card table-wrap" }, el("table", {},
+    el("thead", {}, el("tr", {},
+      el("th", { class: "left" }, "Time"), el("th", { class: "left" }, "Character"), el("th", { class: "left" }, "Realm"),
+      el("th", { class: "left" }, "Action"), el("th", { class: "left" }, "Item"), el("th", {}, "Unit"),
+      el("th", {}, "Qty"), el("th", {}, "Total"), el("th", { class: "left" }, "Notes"), el("th", {}, ""))),
+    el("tbody", {}, ...rows))));
+}
+
+function renderLedger(app) {
+  const hasToken = Boolean(getLedgerToken());
+  app.append(el("div", { class: "ledger-header" },
+    el("p", { class: "count" }, "Manual trade log - logging happens here, holdings/P&L views come next."),
+    el("button", { class: "reset", onclick: () => {
+      const v = prompt(hasToken ? "Replace ledger token (leave blank to clear):" : "Enter ledger write token:", "");
+      if (v !== null) { setLedgerToken(v); render(); }
+    } }, hasToken ? "Change ledger token" : "Set ledger token"),
+  ));
+  if (!hasToken) {
+    app.append(el("div", { class: "card" }, el("div", { class: "empty" },
+      "Set the ledger token to log trades. Reading the existing log below doesn't need one.")));
+  } else {
+    renderLedgerForm(app);
+  }
+  if (state.trades === null) {
+    app.append(el("div", { class: "card" }, el("div", { class: "empty" }, "loading…")));
+  } else {
+    renderLedgerTable(app);
+  }
 }
 
 // ---------- chart ----------
@@ -543,7 +725,11 @@ function route() {
     openDetail(key.includes("|") ? key : `${key}|`);
     return;
   }
-  if (["spreads", "timing", "favorites"].includes(h)) state.tab = h;
+  if (["spreads", "timing", "favorites", "ledger"].includes(h)) state.tab = h;
+  if (h === "ledger" && state.trades === null) {
+    state.trades = []; // avoid re-triggering while the fetch is in flight
+    loadTrades().then(render).catch((e) => { state.trades = null; console.error(e); });
+  }
   state.detail = null;
   render();
 }
