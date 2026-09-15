@@ -22,7 +22,8 @@ class Config:
     r2_bucket = os.environ.get("R2_BUCKET", "coinwarden")
 
     data_dir = Path(os.environ.get("COINWARDEN_DATA_DIR", "data"))
-    retention_days = int(os.environ.get("COINWARDEN_RETENTION_DAYS", "14"))
+    hourly_retention_days = int(os.environ.get("COINWARDEN_HOURLY_RETENTION_DAYS", "3"))
+    daily_retention_days = int(os.environ.get("COINWARDEN_DAILY_RETENTION_DAYS", "60"))
 
     @property
     def r2_configured(self) -> bool:
