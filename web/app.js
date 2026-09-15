@@ -2,25 +2,28 @@
 
 const COPPER = 10_000;
 const PAGE_SIZE = 100;
+const HISTORY_SHARDS = 256;
 const REALM_ORDER = ["ravencrest", "frostmane", "darkspear", "silvermoon", "sylvanas"];
 const REALM_COLOR = Object.fromEntries(REALM_ORDER.map((r, i) => [r, `var(--s${i + 1})`]));
 const QUALITY_ORDER = ["POOR", "COMMON", "UNCOMMON", "RARE", "EPIC", "LEGENDARY", "ARTIFACT", "HEIRLOOM"];
+const STAT_NAMES = { 32: "Crit", 36: "Haste", 40: "Vers", 49: "Mastery" };
 
 const state = {
   tab: "spreads",
   spreads: null,
   timing: null,
   items: new Map(),
+  bonuses: {},
   generatedAt: null,
-  favorites: new Set(loadJSON("cw.favorites", [])),
+  favorites: new Set(loadFavorites()),
   filters: Object.assign({
     maxBuy: 100000, minProfit: 500, minRoi: 20, maxRoi: 400, minSellListings: 3,
     quality: "", itemClass: "", itemSubclass: "", slot: "", search: "", namedOnly: false,
   }, loadJSON("cw.filters", {})),
   sort: { spreads: ["net_profit", -1], timing: ["net_profit", -1], favorites: ["name", 1] },
-  visible: { spreads: 100, timing: 100, favorites: 100 },
+  visible: { spreads: PAGE_SIZE, timing: PAGE_SIZE, favorites: PAGE_SIZE },
   detail: null,
-  chart: { range: "7d", measure: "min_unit_price", hidden: new Set() },
+  chart: { range: "7d", measure: "min", hidden: new Set() },
 };
 
 // ---------- utils ----------
@@ -30,6 +33,12 @@ function loadJSON(key, fallback) {
 function saveJSON(key, value) {
   try { localStorage.setItem(key, JSON.stringify(value)); } catch {}
 }
+function loadFavorites() {
+  // Older builds stored bare item IDs; variant-aware keys are "id|variant".
+  return loadJSON("cw.favorites", []).map((v) => (typeof v === "number" ? `${v}|` : String(v)));
+}
+function rowKey(r) { return `${r.item_id}|${r.variant || ""}`; }
+function splitKey(key) { const i = key.indexOf("|"); return { itemId: Number(key.slice(0, i)), variant: key.slice(i + 1) }; }
 function gold(copper) {
   const g = copper / COPPER;
   if (Math.abs(g) >= 1_000_000) return (g / 1_000_000).toFixed(2) + "M";
@@ -74,17 +83,53 @@ function itemInfo(itemId, row) {
     named: Boolean(i.name || row?.name),
   };
 }
-// Wowhead link: hover shows the full in-game tooltip via their widget, click
-// opens Wowhead in a new tab without triggering the row's detail navigation.
-function whLink(itemId, text) {
-  return el("a", { class: "wh", href: `https://www.wowhead.com/item=${itemId}`, target: "_blank", rel: "noopener",
-    onclick: (e) => e.stopPropagation() }, text);
+function slotLabel(slot) {
+  return slot.toLowerCase().replace(/_/g, " ").replace("non equip", "not equippable");
+}
+
+// ---------- variants ----------
+function parseVariant(variant) {
+  if (!variant) return { bonus: [], mods: {} };
+  const [head, ...modParts] = variant.split("|");
+  const bonus = head ? head.split(":").map(Number) : [];
+  const mods = {};
+  for (const p of modParts) { const [t, v] = p.split("="); mods[Number(t)] = Number(v); }
+  return { bonus, mods };
+}
+// Human label for a variant from the published bonus table; incomplete by
+// design (item-level curves are not decodable client-side) - the Wowhead
+// tooltip carries the exact result.
+function variantLabel(variant, baseLevel) {
+  const { bonus, mods } = parseVariant(variant);
+  const parts = [];
+  let ilvl = null, delta = 0;
+  for (const id of bonus) {
+    const b = state.bonuses[id];
+    if (!b) continue;
+    if (b.itemLevel?.amount) ilvl = b.itemLevel.amount;
+    if (b.level) delta += b.level;
+    if (b.levelOffset?.amount) delta += b.levelOffset.amount;
+    if (b.tag) parts.push(b.tag);
+    if (b.name) parts.push(b.name);
+    if (b.socket) parts.push("socket");
+    if (b.stats && /Leech|Avoidance|RunSpeed|Indestructible/.test(b.stats)) parts.push(b.stats.replace(/^100% /, "").replace(/ \[.*$/, "").replace("RunSpeed", "Speed"));
+  }
+  if (ilvl) parts.unshift(`ilvl ${ilvl}`);
+  else if (delta && baseLevel) parts.unshift(`ilvl ${baseLevel + delta}`);
+  else if (delta) parts.unshift(`${delta > 0 ? "+" : ""}${delta} ilvl`);
+  const stats = [mods[29], mods[30]].filter(Boolean).map((s) => STAT_NAMES[s] || `stat ${s}`);
+  if (stats.length) parts.push(stats.join("/"));
+  if (mods[9]) parts.push(`lvl ${mods[9]}`);
+  if (!parts.length && bonus.length) parts.push(`variant ${bonus.join(":")}`);
+  return parts.join(" · ");
+}
+function whLink(itemId, variant, text) {
+  const { bonus } = parseVariant(variant);
+  const href = `https://www.wowhead.com/item=${itemId}${bonus.length ? `&bonus=${bonus.join(":")}` : ""}`;
+  return el("a", { class: "wh", href, target: "_blank", rel: "noopener", onclick: (e) => e.stopPropagation() }, text);
 }
 function refreshTooltips() {
   if (window.$WowheadPower?.refreshLinks) window.$WowheadPower.refreshLinks();
-}
-function slotLabel(slot) {
-  return slot.toLowerCase().replace(/_/g, " ").replace("non equip", "not equippable");
 }
 
 // ---------- data ----------
@@ -94,13 +139,15 @@ async function fetchJSON(path) {
   return r.json();
 }
 async function load() {
-  const [spreads, timing, items] = await Promise.all([
+  const [spreads, timing, items, bonuses] = await Promise.all([
     fetchJSON("latest/spreads.json"), fetchJSON("latest/timing.json"), fetchJSON("items.json"),
+    fetchJSON("bonuses.json").catch(() => ({ bonuses: {} })),
   ]);
-  state.spreads = spreads.rows;
-  state.timing = timing.rows;
+  state.spreads = spreads.rows.map((r) => ({ ...r, variant: r.variant || "" }));
+  state.timing = timing.rows.map((r) => ({ ...r, variant: r.variant || "" }));
   state.generatedAt = spreads.generated_at;
   for (const it of items.items) state.items.set(it.item_id, it);
+  state.bonuses = bonuses.bonuses || {};
   document.getElementById("meta").textContent = `updated ${ago(state.generatedAt)} · ${state.spreads.length} spreads · ${state.timing.length} timing flips`;
   document.getElementById("realms").textContent = REALM_ORDER.join(" · ");
 }
@@ -146,8 +193,6 @@ function filterBar(kind, source) {
       el("option", { value: "" }, "any"),
       ...values.map((v) => el("option", { value: v, selected: f[key] === v ? "" : null }, format(v)))));
 
-  // Option lists come from the items actually present in this list, so the
-  // dropdowns never offer a choice that yields nothing.
   const infos = source.map((r) => itemInfo(r.item_id, r));
   const uniq = (xs) => [...new Set(xs.filter(Boolean))].sort();
   const classes = uniq(infos.map((i) => i.itemClass));
@@ -172,22 +217,25 @@ function filterBar(kind, source) {
 }
 
 // ---------- tables ----------
-function starButton(itemId) {
-  const on = state.favorites.has(itemId);
+function starButton(key) {
+  const on = state.favorites.has(key);
   return el("button", { class: `star${on ? " on" : ""}`, title: on ? "Remove favorite" : "Add favorite",
-    onclick: (e) => { e.stopPropagation(); toggleFavorite(itemId); } }, on ? "★" : "☆");
+    onclick: (e) => { e.stopPropagation(); toggleFavorite(key); } }, on ? "★" : "☆");
 }
-function toggleFavorite(itemId) {
-  if (state.favorites.has(itemId)) state.favorites.delete(itemId); else state.favorites.add(itemId);
+function toggleFavorite(key) {
+  if (state.favorites.has(key)) state.favorites.delete(key); else state.favorites.add(key);
   saveJSON("cw.favorites", [...state.favorites]);
   render();
 }
-function itemCell(itemId, row) {
-  const info = itemInfo(itemId, row);
+function itemCell(r) {
+  const info = itemInfo(r.item_id, r);
+  const variant = variantLabel(r.variant, info.level);
   return el("td", { class: "item left" },
-    info.icon ? whLink(itemId, el("img", { src: info.icon, alt: "", loading: "lazy" })) : el("span", { style: "width:24px;height:24px" }),
-    el("div", {}, el("div", { class: "name" }, whLink(itemId, info.name)), el("div", { class: "sub" },
-      [info.quality.toLowerCase(), info.cls, info.slot ? slotLabel(info.slot) : "", info.level ? `ilvl ${info.level}` : ""].filter(Boolean).join(" · "))));
+    info.icon ? whLink(r.item_id, r.variant, el("img", { src: info.icon, alt: "", loading: "lazy" })) : el("span", { style: "width:24px;height:24px" }),
+    el("div", {},
+      el("div", { class: "name" }, whLink(r.item_id, r.variant, info.name)),
+      variant ? el("div", { class: "variant" }, variant) : null,
+      el("div", { class: "sub" }, [info.quality.toLowerCase(), info.cls, info.slot ? slotLabel(info.slot) : "", info.level && !variant.startsWith("ilvl") ? `ilvl ${info.level}` : ""].filter(Boolean).join(" · "))));
 }
 function realmCell(realm, price, listings) {
   return el("td", {}, el("div", {}, el("span", { class: "dot", style: `background:${REALM_COLOR[realm] || "var(--muted)"}` }), goldFull(price)),
@@ -201,8 +249,8 @@ function table(kind, rows, columns) {
     onclick: () => { state.sort[kind] = [c.key, c.key === sortKey ? -sortDir : (c.defaultDir || -1)]; render(); },
   }, c.label)));
   const shown = sorted.slice(0, state.visible[kind]);
-  const body = shown.map((r) => el("tr", { onclick: () => openDetail(r.item_id) },
-    el("td", {}, starButton(r.item_id)), ...columns.map((c) => c.cell(r))));
+  const body = shown.map((r) => el("tr", { onclick: () => openDetail(rowKey(r)) },
+    el("td", {}, starButton(rowKey(r))), ...columns.map((c) => c.cell(r))));
   const remaining = sorted.length - shown.length;
   return el("div", { class: "card table-wrap" }, el("table", {}, el("thead", {}, head), el("tbody", {}, ...body)),
     rows.length ? null : el("div", { class: "empty" }, "Nothing matches the current filters."),
@@ -210,7 +258,7 @@ function table(kind, rows, columns) {
       `Show ${Math.min(PAGE_SIZE, remaining)} more (${remaining} remaining)`)) : null);
 }
 const SPREAD_COLS = [
-  { key: "name", label: "Item", left: true, defaultDir: 1, cell: (r) => itemCell(r.item_id, r) },
+  { key: "name", label: "Item", left: true, defaultDir: 1, cell: (r) => itemCell(r) },
   { key: "buy_price", label: "Buy", cell: (r) => realmCell(r.buy_realm, r.buy_price, r.buy_listings) },
   { key: "sell_price", label: "Sell (undercut)", cell: (r) => realmCell(r.sell_realm, r.sell_price, r.sell_listings) },
   { key: "net_profit", label: "Net profit", cell: (r) => el("td", { class: r.net_profit > 0 ? "pos" : "neg" }, goldFull(r.net_profit)) },
@@ -218,18 +266,18 @@ const SPREAD_COLS = [
   { key: "realm_count", label: "Realms", cell: (r) => el("td", {}, r.realm_count) },
 ];
 const TIMING_COLS = [
-  { key: "name", label: "Item", left: true, defaultDir: 1, cell: (r) => itemCell(r.item_id, r) },
+  { key: "name", label: "Item", left: true, defaultDir: 1, cell: (r) => itemCell(r) },
   { key: "realm_slug", label: "Realm", left: true, defaultDir: 1, cell: (r) => el("td", { class: "left" }, el("span", { class: "dot", style: `background:${REALM_COLOR[r.realm_slug]}` }), r.realm_slug) },
   { key: "buy_price", label: "Now", cell: (r) => el("td", {}, goldFull(r.buy_price), el("div", { class: "realm" }, `${r.listing_count} listed`)) },
-  { key: "p50", label: "Normal (p50)", cell: (r) => el("td", {}, goldFull(r.p50), el("div", { class: "realm" }, `${gold(r.p25)}–${gold(r.p75)}`)) },
+  { key: "p50", label: "Normal (p50)", cell: (r) => el("td", {}, goldFull(r.p50), el("div", { class: "realm" }, `${gold(r.p25)}–${gold(r.p75)} · ${r.source === "daily" ? `${r.days} d` : `${r.samples} h`}`)) },
   { key: "discount", label: "Discount", cell: (r) => el("td", { class: "pos" }, pct(r.discount)) },
   { key: "net_profit", label: "Net profit", cell: (r) => el("td", { class: r.net_profit > 0 ? "pos" : "neg" }, goldFull(r.net_profit)) },
   { key: "roi", label: "ROI", cell: (r) => el("td", {}, pct(r.roi)) },
-  { key: "turnover_events", label: "Turnover", cell: (r) => el("td", {}, r.turnover_events, el("div", { class: "realm" }, `${r.snapshots} h history`)) },
+  { key: "turnover_events", label: "Turnover", cell: (r) => el("td", {}, r.turnover_events) },
   { key: "zscore", label: "z", cell: (r) => el("td", {}, r.zscore) },
 ];
 const FAV_COLS = [
-  { key: "name", label: "Item", left: true, defaultDir: 1, cell: (r) => itemCell(r.item_id, r) },
+  { key: "name", label: "Item", left: true, defaultDir: 1, cell: (r) => itemCell(r) },
   { key: "spread", label: "Best spread", cell: (r) => r.spread ? realmCell(r.spread.buy_realm, r.spread.buy_price, r.spread.buy_listings) : el("td", { class: "realm" }, "—") },
   { key: "spread_net", label: "Spread net", cell: (r) => el("td", { class: r.spread ? "pos" : "" }, r.spread ? goldFull(r.spread.net_profit) : "—") },
   { key: "timing_net", label: "Timing net", cell: (r) => el("td", { class: r.timing ? "pos" : "" }, r.timing ? `${goldFull(r.timing.net_profit)} on ${r.timing.realm_slug}` : "—") },
@@ -245,10 +293,11 @@ function renderList() {
   app.append(tabs);
 
   if (state.tab === "favorites") {
-    const rows = [...state.favorites].map((id) => {
-      const spread = sortRows(state.spreads.filter((r) => r.item_id === id), ["net_profit", -1])[0] || null;
-      const timing = sortRows(state.timing.filter((r) => r.item_id === id), ["net_profit", -1])[0] || null;
-      return { item_id: id, spread, timing, spread_net: spread?.net_profit ?? -1, timing_net: timing?.net_profit ?? -1 };
+    const rows = [...state.favorites].map((key) => {
+      const { itemId, variant } = splitKey(key);
+      const spread = sortRows(state.spreads.filter((r) => rowKey(r) === key), ["net_profit", -1])[0] || null;
+      const timing = sortRows(state.timing.filter((r) => rowKey(r) === key), ["net_profit", -1])[0] || null;
+      return { item_id: itemId, variant, spread, timing, spread_net: spread?.net_profit ?? -1, timing_net: timing?.net_profit ?? -1 };
     });
     app.append(el("p", { class: "count" }, rows.length ? `${rows.length} favorites` : "Star items in the other tabs or on an item page to track them here."));
     app.append(table("favorites", rows, FAV_COLS));
@@ -266,35 +315,38 @@ function renderList() {
   app.append(table(kind, rows, kind === "spreads" ? SPREAD_COLS : TIMING_COLS));
 }
 
-const HISTORY_SHARDS = 256;
-async function openDetail(itemId) {
-  location.hash = `item/${itemId}`;
-  state.detail = { itemId, history: null };
+async function openDetail(key) {
+  location.hash = `item/${encodeURIComponent(key)}`;
+  state.detail = { key, history: null };
   render();
+  const { itemId } = splitKey(key);
   try {
     const shard = await fetchJSON(`history/${itemId % HISTORY_SHARDS}.json`);
-    if (state.detail?.itemId === itemId) { state.detail.history = shard.items[String(itemId)] || []; render(); }
+    if (state.detail?.key === key) { state.detail.history = shard.items[key] || { hourly: [], daily: [] }; render(); }
   } catch {
-    if (state.detail?.itemId === itemId) { state.detail.history = []; render(); }
+    if (state.detail?.key === key) { state.detail.history = { hourly: [], daily: [] }; render(); }
   }
 }
 
 function renderDetail() {
   const app = document.getElementById("app");
   app.replaceChildren();
-  const { itemId, history } = state.detail;
+  const { key, history } = state.detail;
+  const { itemId, variant } = splitKey(key);
   const info = itemInfo(itemId);
+  const vlabel = variantLabel(variant, info.level);
   app.append(el("button", { class: "back", onclick: () => { state.detail = null; location.hash = state.tab; render(); } }, "← back"));
   app.append(el("div", { class: "detail-head" },
-    info.icon ? whLink(itemId, el("img", { src: info.icon, alt: "" })) : null,
-    el("div", {}, el("h2", {}, whLink(itemId, info.name), " ", starButton(itemId)), el("div", { class: "sub" }, [info.quality.toLowerCase(), info.cls, `item ${itemId}`].filter(Boolean).join(" · "))),
+    info.icon ? whLink(itemId, variant, el("img", { src: info.icon, alt: "" })) : null,
+    el("div", {}, el("h2", {}, whLink(itemId, variant, info.name), " ", starButton(key)),
+      vlabel ? el("div", { class: "variant" }, vlabel) : null,
+      el("div", { class: "sub" }, [info.quality.toLowerCase(), info.cls, `item ${itemId}`].filter(Boolean).join(" · "))),
   ));
 
   if (history === null) { app.append(el("div", { class: "chart-empty" }, "loading history…")); return; }
 
-  // current per-realm snapshot from the latest timestamp per realm
   const latestByRealm = new Map();
-  for (const r of history) {
+  for (const r of history.hourly) {
     const cur = latestByRealm.get(r.realm_slug);
     if (!cur || r.fetched_at > cur.fetched_at) latestByRealm.set(r.realm_slug, r);
   }
@@ -305,52 +357,63 @@ function renderDetail() {
       el("div", { class: "v" }, goldFull(r.min_unit_price)),
       el("div", { class: "d" }, `median ${goldFull(r.median_unit_price)} · ${r.listing_count} listed · ${ago(r.fetched_at)}`));
   });
+  const hasAny = history.hourly.length || history.daily.length;
   app.append(el("div", { class: "grid" }, ...tiles, tiles.length ? null : el("div", { class: "tile" }, el("div", { class: "d" },
-    history.length ? "Not currently listed on any tracked realm." : "No published history for this item yet — histories cover items that appeared in the lists within the last 7 days."))));
+    hasAny ? "Not listed on any tracked realm in the last 3 days." : "No published history for this variant yet — histories cover variants that appeared in the lists within the last 7 days."))));
 
-  const spread = sortRows(state.spreads.filter((r) => r.item_id === itemId), ["net_profit", -1])[0];
+  const spread = sortRows(state.spreads.filter((r) => rowKey(r) === key), ["net_profit", -1])[0];
   if (spread) {
     app.append(el("div", { class: "grid" },
       el("div", { class: "tile" }, el("div", { class: "l" }, "Best cross-realm flip"), el("div", { class: "v pos" }, goldFull(spread.net_profit)),
         el("div", { class: "d" }, `buy ${spread.buy_realm} ${goldFull(spread.buy_price)} → sell ${spread.sell_realm} ${goldFull(spread.sell_price)} · ROI ${pct(spread.roi)}`))));
   }
 
-  app.append(chartCard(history));
+  if (hasAny) app.append(chartCard(history));
 }
 
 // ---------- chart ----------
 function chartCard(history) {
   const c = state.chart;
   const card = el("div", { class: "card chart-card" });
-  const ranges = [["24h", 1], ["7d", 7], ["14d", 14]];
+  const ranges = [["24h", 1], ["3d", 3], ["7d", 7], ["30d", 30], ["60d", 60]];
   const seg = (items, current, onpick) => el("div", { class: "seg" }, ...items.map(([id, label]) =>
     el("button", { "aria-pressed": String(current === id), onclick: () => { onpick(id); render(); } }, label)));
-  const realms = REALM_ORDER.filter((r) => history.some((h) => h.realm_slug === r));
+  const realms = REALM_ORDER.filter((r) => history.hourly.some((h) => h.realm_slug === r) || history.daily.some((d) => d.realm_slug === r));
   const legend = el("div", { class: "legend" }, ...realms.map((r) => el("label", { style: `color:${REALM_COLOR[r]}` },
     el("input", { type: "checkbox", checked: c.hidden.has(r) ? null : "", onchange: (e) => { if (e.target.checked) c.hidden.delete(r); else c.hidden.add(r); render(); } }),
     el("span", { class: "key" }), el("span", { style: "color:var(--ink-2)" }, r))));
   card.append(el("div", { class: "chart-controls" },
     seg(ranges.map(([id]) => [id, id]), c.range, (id) => { c.range = id; }),
-    seg([["min_unit_price", "Cheapest"], ["median_unit_price", "Median"]], c.measure, (id) => { c.measure = id; }),
+    seg([["min", "Cheapest"], ["median", "Median"]], c.measure, (id) => { c.measure = id; }),
     legend));
 
   const days = ranges.find(([id]) => id === c.range)[1];
   const cutoff = Date.now() - days * 86400000;
-  const series = realms.filter((r) => !c.hidden.has(r)).map((realm) => ({
-    realm, color: REALM_COLOR[realm],
-    points: history.filter((h) => h.realm_slug === realm && new Date(h.fetched_at).getTime() >= cutoff)
-      .map((h) => ({ t: new Date(h.fetched_at).getTime(), v: h[c.measure] / COPPER, n: h.listing_count })),
-  })).filter((s) => s.points.length);
+  // Hourly points cover the last 3 days; daily rollups (plotted at noon UTC)
+  // cover the rest, using the day's typical cheapest / mean median price.
+  const hourlyStart = history.hourly.length ? Math.min(...history.hourly.map((h) => new Date(h.fetched_at).getTime())) : Infinity;
+  const series = realms.filter((r) => !c.hidden.has(r)).map((realm) => {
+    const pts = history.hourly.filter((h) => h.realm_slug === realm).map((h) => ({
+      t: new Date(h.fetched_at).getTime(), v: (c.measure === "min" ? h.min_unit_price : h.median_unit_price) / COPPER, n: h.listing_count, daily: false }));
+    for (const d of history.daily.filter((d) => d.realm_slug === realm)) {
+      const t = new Date(`${d.day}T12:00:00Z`).getTime();
+      if (t < hourlyStart) pts.push({ t, v: (c.measure === "min" ? d.typical_price : d.median_price) / COPPER, n: Math.round(d.avg_listing_count), daily: true });
+    }
+    return { realm, color: REALM_COLOR[realm], points: pts.filter((p) => p.t >= cutoff).sort((a, b) => a.t - b.t) };
+  }).filter((s) => s.points.length);
 
   if (!series.length) { card.append(el("div", { class: "chart-empty" }, "No data in this range.")); return card; }
   card.append(lineChart(series));
 
-  const rows = history.filter((h) => new Date(h.fetched_at).getTime() >= cutoff).sort((a, b) => b.fetched_at.localeCompare(a.fetched_at));
+  const rows = [
+    ...history.hourly.map((h) => ({ t: h.fetched_at, realm: h.realm_slug, low: h.min_unit_price, med: h.median_unit_price, n: h.listing_count, kind: "hour" })),
+    ...history.daily.map((d) => ({ t: d.day, realm: d.realm_slug, low: d.low_price, med: d.median_price, n: Math.round(d.avg_listing_count), kind: "day" })),
+  ].filter((r) => new Date(r.t).getTime() >= cutoff).sort((a, b) => b.t.localeCompare(a.t));
   card.append(el("details", { class: "tv" }, el("summary", {}, `Table view (${rows.length} rows)`),
     el("div", { class: "table-wrap" }, el("table", {},
       el("thead", {}, el("tr", {}, el("th", { class: "left" }, "Time"), el("th", { class: "left" }, "Realm"), el("th", {}, "Cheapest"), el("th", {}, "Median"), el("th", {}, "Listed"))),
-      el("tbody", {}, ...rows.map((h) => el("tr", {}, el("td", { class: "left" }, new Date(h.fetched_at).toLocaleString()), el("td", { class: "left" }, h.realm_slug),
-        el("td", {}, goldFull(h.min_unit_price)), el("td", {}, goldFull(h.median_unit_price)), el("td", {}, h.listing_count))))))));
+      el("tbody", {}, ...rows.map((r) => el("tr", {}, el("td", { class: "left" }, r.kind === "day" ? `${r.t} (day)` : new Date(r.t).toLocaleString()), el("td", { class: "left" }, r.realm),
+        el("td", {}, goldFull(r.low)), el("td", {}, goldFull(r.med)), el("td", {}, r.n))))))));
   return card;
 }
 
@@ -370,8 +433,7 @@ function lineChart(series) {
   svg.setAttribute("role", "img");
   const mk = (tag, attrs) => { const n = document.createElementNS(svgNS, tag); for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, v); return n; };
 
-  const ticks = niceTicks(vMin, vMax, 4);
-  for (const v of ticks) {
+  for (const v of niceTicks(vMin, vMax, 4)) {
     svg.append(mk("line", { x1: P.l, x2: W - P.r, y1: y(v), y2: y(v), stroke: "var(--grid)", "stroke-width": 1 }));
     const label = mk("text", { x: P.l - 8, y: y(v) + 4, "text-anchor": "end", fill: "var(--muted)", "font-size": 11 });
     label.textContent = gold(v * COPPER); svg.append(label);
@@ -386,7 +448,7 @@ function lineChart(series) {
     svg.append(label);
   }
   for (const s of series) {
-    const pts = s.points.slice().sort((a, b) => a.t - b.t);
+    const pts = s.points;
     const d = pts.map((p, i) => `${i ? "L" : "M"}${x(p.t).toFixed(1)},${y(p.v).toFixed(1)}`).join(" ");
     svg.append(mk("path", { d, fill: "none", stroke: s.color, "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }));
     const last = pts[pts.length - 1];
@@ -406,7 +468,8 @@ function lineChart(series) {
     let best = times[0];
     for (const tt of times) if (Math.abs(tt - t) < Math.abs(best - t)) best = tt;
     cross.setAttribute("x1", x(best)); cross.setAttribute("x2", x(best)); cross.setAttribute("visibility", "visible");
-    tip.replaceChildren(el("div", { class: "t" }, new Date(best).toLocaleString()));
+    const anyDaily = all.some((p) => p.t === best && p.daily);
+    tip.replaceChildren(el("div", { class: "t" }, anyDaily ? `${new Date(best).toLocaleDateString()} (daily)` : new Date(best).toLocaleString()));
     for (const s of series) {
       const p = s.points.find((q) => q.t === best);
       if (!p) continue;
@@ -438,8 +501,12 @@ function render() {
 }
 function route() {
   const h = location.hash.slice(1);
-  const m = h.match(/^item\/(\d+)$/);
-  if (m) { openDetail(Number(m[1])); return; }
+  const m = h.match(/^item\/(.+)$/);
+  if (m) {
+    const key = decodeURIComponent(m[1]);
+    openDetail(key.includes("|") ? key : `${key}|`);
+    return;
+  }
   if (["spreads", "timing", "favorites"].includes(h)) state.tab = h;
   state.detail = null;
   render();
