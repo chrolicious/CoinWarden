@@ -221,7 +221,8 @@ function filterBar(kind, source) {
   const set = (key, value) => { f[key] = value; saveJSON("cw.filters", f); state.visible[kind] = PAGE_SIZE; render(); };
   const setDebounced = (key, value) => { clearTimeout(searchTimer); searchTimer = setTimeout(() => set(key, value), 200); };
   const num = (label, key, opts = {}) => el("label", {}, label,
-    el("input", { type: "number", value: f[key], min: 0, step: opts.step || 1, oninput: (e) => setDebounced(key, Number(e.target.value) || 0) }));
+    el("input", { type: "number", value: f[key], min: 0, step: opts.step || 1, "data-fkey": `filter-${key}`,
+      oninput: (e) => setDebounced(key, Number(e.target.value) || 0) }));
   const select = (label, key, values, format = (v) => v) => el("label", {}, label,
     el("select", { onchange: (e) => set(key, e.target.value) },
       el("option", { value: "" }, "any"),
@@ -235,7 +236,8 @@ function filterBar(kind, source) {
   if (f.itemSubclass && !subclasses.includes(f.itemSubclass)) f.itemSubclass = "";
 
   return el("div", { class: "filters" },
-    el("label", {}, "Search", el("input", { class: "wide", type: "search", value: f.search, placeholder: "item name", oninput: (e) => setDebounced("search", e.target.value) })),
+    el("label", {}, "Search", el("input", { class: "wide", type: "search", value: f.search, placeholder: "item name", "data-fkey": "filter-search",
+      oninput: (e) => setDebounced("search", e.target.value) })),
     select("Type", "itemClass", classes),
     select("Subtype", "itemSubclass", subclasses),
     select("Slot", "slot", slots, slotLabel),
@@ -466,7 +468,7 @@ function renderLedgerForm(app) {
   const itemField = el("div", { class: "item-search" },
     el("label", {}, "Item",
       el("input", {
-        type: "text", value: f.itemQuery, placeholder: "search item name",
+        type: "text", value: f.itemQuery, placeholder: "search item name", "data-fkey": "ledger-item-query",
         oninput: (e) => { f.itemQuery = e.target.value; f.selectedItem = null; render(); },
       })),
     f.selectedItem ? el("div", { class: "picked" },
@@ -507,7 +509,7 @@ function renderLedgerForm(app) {
     },
   },
     el("div", { class: "ledger-row" },
-      el("label", {}, "Character", el("input", { type: "text", required: "", value: f.character, maxlength: 64,
+      el("label", {}, "Character", el("input", { type: "text", required: "", value: f.character, maxlength: 64, "data-fkey": "ledger-character",
         oninput: (e) => setField("character", e.target.value) })),
       el("label", {}, "Realm", el("select", { onchange: (e) => setField("realm", e.target.value) },
         ...REALM_ORDER.map((r) => el("option", { value: r, selected: f.realm === r ? "" : null }, r)))),
@@ -517,14 +519,14 @@ function renderLedgerForm(app) {
     ),
     itemField,
     el("div", { class: "ledger-row" },
-      el("label", {}, "Variant (optional)", el("input", { type: "text", value: f.variant, placeholder: "bonus IDs, leave blank for base",
+      el("label", {}, "Variant (optional)", el("input", { type: "text", value: f.variant, placeholder: "bonus IDs, leave blank for base", "data-fkey": "ledger-variant",
         oninput: (e) => setField("variant", e.target.value) })),
-      el("label", {}, "Unit price (g)", el("input", { type: "number", min: 0, step: "0.01", required: "", value: f.price,
+      el("label", {}, "Unit price (g)", el("input", { type: "number", min: 0, step: "0.01", required: "", value: f.price, "data-fkey": "ledger-price",
         oninput: (e) => setField("price", e.target.value) })),
-      el("label", {}, "Quantity", el("input", { type: "number", min: 1, step: 1, required: "", value: f.quantity,
+      el("label", {}, "Quantity", el("input", { type: "number", min: 1, step: 1, required: "", value: f.quantity, "data-fkey": "ledger-quantity",
         oninput: (e) => setField("quantity", e.target.value) })),
     ),
-    el("label", { class: "notes" }, "Notes (optional)", el("input", { type: "text", value: f.notes, maxlength: 256,
+    el("label", { class: "notes" }, "Notes (optional)", el("input", { type: "text", value: f.notes, maxlength: 256, "data-fkey": "ledger-notes",
       oninput: (e) => setField("notes", e.target.value) })),
     el("div", { class: "ledger-row" },
       el("button", { type: "submit", class: "primary" }, `Log ${f.action}`),
@@ -712,10 +714,28 @@ function niceTicks(min, max, count) {
 }
 
 // ---------- routing ----------
+// Every render() rebuilds the DOM from scratch, which would normally drop
+// focus out of whatever input the user is typing in. Inputs that matter for
+// typing carry a stable data-fkey; we snapshot the focused one (and its
+// cursor position) before rebuilding and restore it after.
 function render() {
   if (!state.spreads) return;
+  const active = document.activeElement;
+  const fkey = active?.dataset?.fkey;
+  const focusInfo = fkey ? { fkey, selStart: active.selectionStart, selEnd: active.selectionEnd } : null;
+
   if (state.detail) renderDetail(); else renderList();
   refreshTooltips();
+
+  if (focusInfo) {
+    const el2 = document.querySelector(`[data-fkey="${focusInfo.fkey}"]`);
+    if (el2) {
+      el2.focus();
+      if (focusInfo.selStart != null && typeof el2.setSelectionRange === "function") {
+        try { el2.setSelectionRange(focusInfo.selStart, focusInfo.selEnd); } catch {}
+      }
+    }
+  }
 }
 function route() {
   const h = location.hash.slice(1);
