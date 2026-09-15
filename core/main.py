@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from core.config import Config
 from core.api_client import BattleNetClient
 from core.db import get_client, ensure_schema, insert_item_snapshots
+from core.items import sync_item_metadata
 
 
 def _unit_price(auction: dict) -> float | None:
@@ -61,7 +62,7 @@ def _rows_from_aggregates(realm_slug: str, connected_realm_id: int, aggregates: 
 
 
 def main():
-    faulthandler.dump_traceback_later(90, exit=True, file=sys.stderr)
+    faulthandler.dump_traceback_later(600, exit=True, file=sys.stderr)
 
     try:
         _run()
@@ -92,6 +93,7 @@ def _run():
     fetched_at = datetime.now(timezone.utc).isoformat()
 
     seen_connected_realm_ids = set()
+    seen_item_ids: set[int] = set()
     for realm_slug in config.realm_slugs:
         connected_realm_id = client.get_connected_realm_id(realm_slug)
         print(f"{realm_slug}: connected realm ID {connected_realm_id}", flush=True)
@@ -107,6 +109,7 @@ def _run():
 
         t0 = time.monotonic()
         aggregates = _aggregate_by_item(auctions)
+        seen_item_ids.update(aggregates.keys())
         rows = _rows_from_aggregates(realm_slug, connected_realm_id, aggregates, fetched_at)
         print(f"  aggregated to {len(rows)} items in {time.monotonic() - t0:.2f}s", flush=True)
 
@@ -114,6 +117,7 @@ def _run():
         insert_item_snapshots(db, rows)
         print(f"  wrote {len(rows)} rows to DB in {time.monotonic() - t0:.2f}s", flush=True)
 
+    sync_item_metadata(client, db, seen_item_ids)
     db.close()
 
 

@@ -20,6 +20,19 @@ CREATE TABLE IF NOT EXISTS item_price_snapshots (
 CREATE INDEX IF NOT EXISTS idx_item_snapshots_lookup
     ON item_price_snapshots (connected_realm_id, item_id, fetched_at);
 
+CREATE TABLE IF NOT EXISTS items (
+    item_id INTEGER PRIMARY KEY,
+    name TEXT,
+    quality TEXT,
+    item_class TEXT,
+    item_subclass TEXT,
+    inventory_type TEXT,
+    item_level INTEGER,
+    vendor_sell_price INTEGER,
+    icon_url TEXT,
+    fetched_at TEXT NOT NULL
+);
+
 DROP TABLE IF EXISTS auction_snapshots;
 """
 
@@ -56,3 +69,32 @@ def insert_item_snapshots(client: libsql_client.Client, rows: list[tuple]) -> No
         client.batch(batch[i : i + 500])
         elapsed = time.monotonic() - t0
         print(f"    batch {batch_num}/{total_batches} ({len(batch[i:i+500])} rows) in {elapsed:.2f}s", flush=True)
+
+
+def get_known_item_ids(client: libsql_client.Client) -> set[int]:
+    result = client.execute("SELECT item_id FROM items")
+    return {row[0] for row in result.rows}
+
+
+def upsert_items(client: libsql_client.Client, rows: list[tuple]) -> None:
+    if not rows:
+        return
+
+    statement = """
+        INSERT INTO items
+            (item_id, name, quality, item_class, item_subclass, inventory_type, item_level, vendor_sell_price, icon_url, fetched_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(item_id) DO UPDATE SET
+            name = excluded.name,
+            quality = excluded.quality,
+            item_class = excluded.item_class,
+            item_subclass = excluded.item_subclass,
+            inventory_type = excluded.inventory_type,
+            item_level = excluded.item_level,
+            vendor_sell_price = excluded.vendor_sell_price,
+            icon_url = excluded.icon_url,
+            fetched_at = excluded.fetched_at
+    """
+    batch = [libsql_client.Statement(statement, row) for row in rows]
+    for i in range(0, len(batch), 500):
+        client.batch(batch[i : i + 500])
