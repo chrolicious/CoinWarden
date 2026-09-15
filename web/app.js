@@ -1,6 +1,7 @@
 "use strict";
 
 const COPPER = 10_000;
+const PAGE_SIZE = 100;
 const REALM_ORDER = ["ravencrest", "frostmane", "darkspear", "silvermoon", "sylvanas"];
 const REALM_COLOR = Object.fromEntries(REALM_ORDER.map((r, i) => [r, `var(--s${i + 1})`]));
 const QUALITY_ORDER = ["POOR", "COMMON", "UNCOMMON", "RARE", "EPIC", "LEGENDARY", "ARTIFACT", "HEIRLOOM"];
@@ -17,6 +18,7 @@ const state = {
     quality: "", itemClass: "", itemSubclass: "", slot: "", search: "", namedOnly: false,
   }, loadJSON("cw.filters", {})),
   sort: { spreads: ["net_profit", -1], timing: ["net_profit", -1], favorites: ["name", 1] },
+  visible: { spreads: 100, timing: 100, favorites: 100 },
   detail: null,
   chart: { range: "7d", measure: "min_unit_price", hidden: new Set() },
 };
@@ -132,11 +134,13 @@ function sortRows(rows, [key, dir]) {
     return (av < bv ? -1 : 1) * dir;
   });
 }
+let searchTimer = null;
 function filterBar(kind, source) {
   const f = state.filters;
-  const set = (key, value) => { f[key] = value; saveJSON("cw.filters", f); render(); };
+  const set = (key, value) => { f[key] = value; saveJSON("cw.filters", f); state.visible[kind] = PAGE_SIZE; render(); };
+  const setDebounced = (key, value) => { clearTimeout(searchTimer); searchTimer = setTimeout(() => set(key, value), 200); };
   const num = (label, key, opts = {}) => el("label", {}, label,
-    el("input", { type: "number", value: f[key], min: 0, step: opts.step || 1, oninput: (e) => set(key, Number(e.target.value) || 0) }));
+    el("input", { type: "number", value: f[key], min: 0, step: opts.step || 1, oninput: (e) => setDebounced(key, Number(e.target.value) || 0) }));
   const select = (label, key, values, format = (v) => v) => el("label", {}, label,
     el("select", { onchange: (e) => set(key, e.target.value) },
       el("option", { value: "" }, "any"),
@@ -152,7 +156,7 @@ function filterBar(kind, source) {
   if (f.itemSubclass && !subclasses.includes(f.itemSubclass)) f.itemSubclass = "";
 
   return el("div", { class: "filters" },
-    el("label", {}, "Search", el("input", { class: "wide", type: "search", value: f.search, placeholder: "item name", oninput: (e) => set("search", e.target.value) })),
+    el("label", {}, "Search", el("input", { class: "wide", type: "search", value: f.search, placeholder: "item name", oninput: (e) => setDebounced("search", e.target.value) })),
     select("Type", "itemClass", classes),
     select("Subtype", "itemSubclass", subclasses),
     select("Slot", "slot", slots, slotLabel),
@@ -196,10 +200,14 @@ function table(kind, rows, columns) {
     class: `${c.left ? "left " : ""}${c.key === sortKey ? "sorted" : ""} ${sortDir > 0 && c.key === sortKey ? "asc" : ""}`,
     onclick: () => { state.sort[kind] = [c.key, c.key === sortKey ? -sortDir : (c.defaultDir || -1)]; render(); },
   }, c.label)));
-  const body = sorted.map((r) => el("tr", { onclick: () => openDetail(r.item_id) },
+  const shown = sorted.slice(0, state.visible[kind]);
+  const body = shown.map((r) => el("tr", { onclick: () => openDetail(r.item_id) },
     el("td", {}, starButton(r.item_id)), ...columns.map((c) => c.cell(r))));
+  const remaining = sorted.length - shown.length;
   return el("div", { class: "card table-wrap" }, el("table", {}, el("thead", {}, head), el("tbody", {}, ...body)),
-    rows.length ? null : el("div", { class: "empty" }, "Nothing matches the current filters."));
+    rows.length ? null : el("div", { class: "empty" }, "Nothing matches the current filters."),
+    remaining > 0 ? el("div", { class: "more" }, el("button", { onclick: () => { state.visible[kind] += PAGE_SIZE; render(); } },
+      `Show ${Math.min(PAGE_SIZE, remaining)} more (${remaining} remaining)`)) : null);
 }
 const SPREAD_COLS = [
   { key: "name", label: "Item", left: true, defaultDir: 1, cell: (r) => itemCell(r.item_id, r) },
