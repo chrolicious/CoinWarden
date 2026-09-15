@@ -23,6 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 55
     permissions:
+      contents: read
       actions: read
     steps:
       - name: Skip if a run succeeded in the last 50 minutes
