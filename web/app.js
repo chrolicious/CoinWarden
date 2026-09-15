@@ -1,6 +1,7 @@
 "use strict";
 
 const COPPER = 10_000;
+const GOAL_GOLD = 7_000_000;
 const PAGE_SIZE = 100;
 const HISTORY_SHARDS = 256;
 const REALM_ORDER = ["ravencrest", "frostmane", "darkspear", "silvermoon", "sylvanas"];
@@ -25,6 +26,7 @@ const state = {
   detail: null,
   chart: { range: "7d", measure: "min", hidden: new Set() },
   trades: null,
+  networth: null,
   ledgerForm: Object.assign({ character: "", realm: REALM_ORDER[0], action: "buy", itemQuery: "",
     selectedItem: null, variant: "", price: "", quantity: 1, notes: "" }, loadJSON("cw.ledgerFormDefaults", {})),
 };
@@ -172,6 +174,23 @@ async function deleteTrade(id) {
   });
   if (!r.ok) { const data = await r.json().catch(() => ({})); throw new Error(data.error || `ledger: ${r.status}`); }
 }
+async function loadNetworth() {
+  const r = await fetch("api/networth", { cache: "no-cache" });
+  if (!r.ok) throw new Error(`networth: ${r.status}`);
+  state.networth = await r.json();
+}
+async function saveLiquidGold(goldValue) {
+  const token = getLedgerToken();
+  if (!token) throw new Error("No ledger token set.");
+  const r = await fetch("api/networth", {
+    method: "PUT",
+    headers: { "content-type": "application/json", "x-ledger-token": token },
+    body: JSON.stringify({ liquid_gold: Math.round(goldValue * COPPER) }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `networth: ${r.status}`);
+  state.networth = data;
+}
 async function load() {
   const [spreads, timing, items, bonuses] = await Promise.all([
     fetchJSON("latest/spreads.json"), fetchJSON("latest/timing.json"), fetchJSON("items.json"),
@@ -183,7 +202,11 @@ async function load() {
   for (const it of items.items) state.items.set(it.item_id, it);
   state.bonuses = bonuses.bonuses || {};
   document.getElementById("meta").textContent = `updated ${ago(state.generatedAt)} · ${state.spreads.length} spreads · ${state.timing.length} timing flips`;
-  document.getElementById("realms").textContent = REALM_ORDER.join(" · ");
+  const realmsEl = document.getElementById("realms");
+  realmsEl.replaceChildren(...REALM_ORDER.flatMap((r, i) => [
+    el("span", { class: "dot", style: `background:${REALM_COLOR[r]}` }), r,
+    i < REALM_ORDER.length - 1 ? " · " : "",
+  ]));
 }
 
 // ---------- filters ----------
@@ -281,6 +304,7 @@ function table(kind, rows, columns) {
   const sorted = sortRows(rows, [sortKey, sortDir]);
   const head = el("tr", {}, el("th", {}, ""), ...columns.map((c) => el("th", {
     class: `${c.left ? "left " : ""}${c.key === sortKey ? "sorted" : ""} ${sortDir > 0 && c.key === sortKey ? "asc" : ""}`,
+    title: c.hint || null,
     onclick: () => { state.sort[kind] = [c.key, c.key === sortKey ? -sortDir : (c.defaultDir || -1)]; render(); },
   }, c.label)));
   const shown = sorted.slice(0, state.visible[kind]);
@@ -310,22 +334,34 @@ function riskCell(r) {
 }
 const SPREAD_COLS = [
   { key: "name", label: "Item", left: true, defaultDir: 1, cell: (r) => itemCell(r) },
-  { key: "buy_price", label: "Buy", cell: (r) => realmCell(r.buy_realm, r.buy_price, r.buy_listings) },
-  { key: "sold_median_7d", label: "Sold on (7d evidence)", cell: (r) => soldCell(r, true) },
-  { key: "score_per_day", label: "EV / day locked", cell: evDayCell },
-  { key: "net_profit", label: "Net if sold", cell: riskCell },
-  { key: "realm_count", label: "Realms", cell: (r) => el("td", {}, r.realm_count) },
+  { key: "buy_price", label: "Buy", hint: "Cheapest current listing on the buy realm - the price you'd pay now.",
+    cell: (r) => realmCell(r.buy_realm, r.buy_price, r.buy_listings) },
+  { key: "sold_median_7d", label: "Sell on", hint: "The realm and price this exact variant actually sold for (median of the last 7 days), not the current asking price. The × count is how many confirmed sales back that number.",
+    cell: (r) => soldCell(r, true) },
+  { key: "score_per_day", label: "EV / day locked", hint: "Expected profit per day your buy gold is tied up: (chance it sells within 48h × net profit) minus (chance it doesn't × deposit loss), divided by expected days-to-sell. This is what the list is sorted by.",
+    cell: evDayCell },
+  { key: "net_profit", label: "Net if sold", hint: "Profit if the sale happens at the 7-day sold price, before weighting by the odds of that happening (see EV/day for the risk-adjusted number).",
+    cell: riskCell },
+  { key: "realm_count", label: "Realms", hint: "How many of the 5 tracked realms currently have any listing of this exact item variant.",
+    cell: (r) => el("td", {}, r.realm_count) },
 ];
 const TIMING_COLS = [
   { key: "name", label: "Item", left: true, defaultDir: 1, cell: (r) => itemCell(r) },
   { key: "realm_slug", label: "Realm", left: true, defaultDir: 1, cell: (r) => el("td", { class: "left" }, el("span", { class: "dot", style: `background:${REALM_COLOR[r.realm_slug]}` }), r.realm_slug) },
-  { key: "buy_price", label: "Now", cell: (r) => el("td", {}, goldFull(r.buy_price), el("div", { class: "realm" }, `${r.sell_listings} listed`)) },
-  { key: "p50", label: "Normal ask (p50)", cell: (r) => el("td", {}, goldFull(r.p50), el("div", { class: "realm" }, `${gold(r.p25)}–${gold(r.p75)} · ${r.source === "daily" ? `${r.days} d` : `${r.samples} h`}`)) },
-  { key: "discount", label: "Discount", cell: (r) => el("td", { class: "pos" }, pct(r.discount)) },
-  { key: "sold_median_7d", label: "Sold (7d evidence)", cell: (r) => soldCell(r, false) },
-  { key: "score_per_day", label: "EV / day locked", cell: evDayCell },
-  { key: "net_profit", label: "Net if sold", cell: riskCell },
-  { key: "turnover_events", label: "Turnover", cell: (r) => el("td", {}, r.turnover_events) },
+  { key: "buy_price", label: "Buy now", hint: "Cheapest current listing on this realm.",
+    cell: (r) => el("td", {}, goldFull(r.buy_price), el("div", { class: "realm" }, `${r.sell_listings} listed`)) },
+  { key: "p50", label: "Normal ask (p50)", hint: "This variant's typical asking price on this realm (median over its trailing history) - what “priced below normal” is measured against.",
+    cell: (r) => el("td", {}, goldFull(r.p50), el("div", { class: "realm" }, `${gold(r.p25)}–${gold(r.p75)} · ${r.source === "daily" ? `${r.days} d` : `${r.samples} h`}`)) },
+  { key: "discount", label: "Discount", hint: "How far the current price sits below the normal ask (p50).",
+    cell: (r) => el("td", { class: "pos" }, pct(r.discount)) },
+  { key: "sold_median_7d", label: "Sell (7d evidence)", hint: "What this variant actually sold for on this realm (median of the last 7 days) - the price used for profit, not the current ask.",
+    cell: (r) => soldCell(r, false) },
+  { key: "score_per_day", label: "EV / day locked", hint: "Expected profit per day your buy gold is tied up: (chance it sells within 48h × net profit) minus (chance it doesn't × deposit loss), divided by expected days-to-sell. This is what the list is sorted by.",
+    cell: evDayCell },
+  { key: "net_profit", label: "Net if sold", hint: "Profit if the sale happens at the 7-day sold price, before weighting by the odds of that happening (see EV/day for the risk-adjusted number).",
+    cell: riskCell },
+  { key: "turnover_events", label: "Turnover", hint: "Hour-to-hour listing-count drops in the lookback window - a rough liquidity signal.",
+    cell: (r) => el("td", {}, r.turnover_events) },
   { key: "zscore", label: "z", cell: (r) => el("td", {}, r.zscore) },
 ];
 const FAV_COLS = [
@@ -341,11 +377,12 @@ function renderList() {
   app.replaceChildren();
   const tabs = el("nav", { class: "tabs", role: "tablist" }, ...[
     ["spreads", "Cross-realm flips"], ["timing", "Timing flips"], ["favorites", `Favorites (${state.favorites.size})`],
-    ["ledger", "Ledger"],
+    ["ledger", "Ledger"], ["holdings", "Holdings & Goal"],
   ].map(([id, label]) => el("button", { role: "tab", "aria-selected": String(state.tab === id), onclick: () => { state.tab = id; location.hash = id; render(); } }, label)));
   app.append(tabs);
 
   if (state.tab === "ledger") { renderLedger(app); return; }
+  if (state.tab === "holdings") { renderHoldings(app); return; }
 
   if (state.tab === "favorites") {
     const rows = [...state.favorites].map((key) => {
@@ -572,7 +609,7 @@ function renderLedgerTable(app) {
 function renderLedger(app) {
   const hasToken = Boolean(getLedgerToken());
   app.append(el("div", { class: "ledger-header" },
-    el("p", { class: "count" }, "Manual trade log - logging happens here, holdings/P&L views come next."),
+    el("p", { class: "count" }, "Manual trade log. See the Holdings & Goal tab for P&L and capital-at-risk."),
     el("button", { class: "reset", onclick: () => {
       const v = prompt(hasToken ? "Replace ledger token (leave blank to clear):" : "Enter ledger write token:", "");
       if (v !== null) { setLedgerToken(v); render(); }
@@ -588,6 +625,176 @@ function renderLedger(app) {
     app.append(el("div", { class: "card" }, el("div", { class: "empty" }, "loading…")));
   } else {
     renderLedgerTable(app);
+  }
+}
+
+// ---------- holdings, P&L, capital-at-risk, goal tracker ----------
+
+// FIFO-matches sells against earlier buys, pooled per (item, variant) across
+// all characters/realms - both gold and items move freely account-wide via
+// the Warband bank, so per-character silos would be artificial. A sell with
+// no matching buy lot (item obtained some other way, or logged out of order)
+// is flagged rather than silently assumed free.
+function computeLedger(trades) {
+  const keyOf = (t) => `${t.item_id}|${t.variant || ""}`;
+  const lots = new Map();
+  const realized = new Map();
+  const flagged = [];
+  const nameOf = new Map();
+
+  for (const t of trades.slice().sort((a, b) => a.ts.localeCompare(b.ts))) {
+    const k = keyOf(t);
+    nameOf.set(k, { item_id: t.item_id, variant: t.variant || "", name: t.item_name });
+
+    if (t.action === "buy") {
+      if (!lots.has(k)) lots.set(k, []);
+      lots.get(k).push({ qty: t.quantity, unit_price: t.unit_price });
+      continue;
+    }
+
+    const queue = lots.get(k) || [];
+    let remaining = t.quantity;
+    let profit = 0;
+    let costBasisQty = 0;
+    while (remaining > 0 && queue.length) {
+      const lot = queue[0];
+      const take = Math.min(lot.qty, remaining);
+      profit += (t.unit_price - lot.unit_price) * take;
+      costBasisQty += take;
+      lot.qty -= take;
+      remaining -= take;
+      if (lot.qty <= 0) queue.shift();
+    }
+    if (remaining > 0) {
+      profit += t.unit_price * remaining;
+      flagged.push({ trade: t, unmatchedQty: remaining });
+    }
+    if (!realized.has(k)) realized.set(k, { profit: 0, soldQty: 0, costBasisQty: 0, unmatchedQty: 0 });
+    const r = realized.get(k);
+    r.profit += profit;
+    r.soldQty += t.quantity;
+    r.costBasisQty += costBasisQty;
+    r.unmatchedQty += t.quantity - costBasisQty;
+  }
+
+  const positions = [];
+  for (const [k, queue] of lots.entries()) {
+    const qty = queue.reduce((s, l) => s + l.qty, 0);
+    if (qty <= 0) continue;
+    const totalCost = queue.reduce((s, l) => s + l.qty * l.unit_price, 0);
+    positions.push({ ...nameOf.get(k), qty, totalCost, avgCost: totalCost / qty });
+  }
+  const realizedList = [...realized.entries()].map(([k, r]) => ({ ...nameOf.get(k), ...r }));
+
+  return { positions, realized: realizedList, flagged };
+}
+
+// Best-effort current value: highest realized sold price seen for this
+// variant across tracked realms in today's published lists. Returns null
+// (shown as "no live price") rather than guessing when the item isn't
+// currently featured in either list.
+function estimateLiveValue(item_id, variant) {
+  let best = null;
+  for (const r of state.spreads) {
+    if (r.item_id === item_id && (r.variant || "") === variant) best = Math.max(best ?? 0, r.sold_median_7d ?? 0, r.current_ask ?? 0);
+  }
+  for (const r of state.timing) {
+    if (r.item_id === item_id && (r.variant || "") === variant) best = Math.max(best ?? 0, r.sold_median_7d ?? 0, r.p50 ?? 0);
+  }
+  return best;
+}
+
+function renderHoldings(app) {
+  if (state.trades === null || state.networth === null) {
+    app.append(el("div", { class: "card" }, el("div", { class: "empty" }, "loading…")));
+    return;
+  }
+  const hasToken = Boolean(getLedgerToken());
+  const { positions, realized, flagged } = computeLedger(state.trades);
+
+  const totalCostBasis = positions.reduce((s, p) => s + p.totalCost, 0);
+  let totalLiveValue = 0, positionsWithLivePrice = 0;
+  const positionRows = positions.map((p) => {
+    const live = estimateLiveValue(p.item_id, p.variant);
+    if (live != null) { totalLiveValue += live * p.qty; positionsWithLivePrice++; }
+    return { ...p, live };
+  }).sort((a, b) => b.totalCost - a.totalCost);
+
+  const liquidGold = state.networth.liquid_gold || 0;
+  const holdingsValue = totalLiveValue || totalCostBasis; // fall back to cost basis when nothing has a live price
+  const netWorth = liquidGold + holdingsValue;
+  const goalCopper = GOAL_GOLD * COPPER;
+  const progress = Math.min(1, netWorth / goalCopper);
+
+  app.append(el("div", { class: "ledger-header" },
+    el("p", { class: "count" }, "Computed from the ledger - FIFO cost basis, pooled across characters/realms."),
+    hasToken ? el("button", { class: "reset", onclick: async () => {
+      const v = prompt("Update liquid gold (across all characters, in gold):", String((liquidGold / COPPER).toFixed(0)));
+      if (v === null) return;
+      const n = Number(v);
+      if (!Number.isFinite(n) || n < 0) { alert("Enter a non-negative number."); return; }
+      try { await saveLiquidGold(n); render(); } catch (e) { alert(e.message); }
+    } }, "Update liquid gold") : null,
+  ));
+
+  // Goal tracker
+  app.append(el("div", { class: "card goal-card" },
+    el("div", { class: "goal-top" },
+      el("div", {}, el("div", { class: "l" }, "Net worth"), el("div", { class: "v" }, goldFull(netWorth))),
+      el("div", {}, el("div", { class: "l" }, "Goal"), el("div", { class: "v" }, goldFull(goalCopper))),
+      el("div", {}, el("div", { class: "l" }, "Remaining"), el("div", { class: "v" }, goldFull(Math.max(0, goalCopper - netWorth)))),
+    ),
+    el("div", { class: "goal-bar" }, el("div", { class: "goal-fill", style: `width:${(progress * 100).toFixed(1)}%` })),
+    el("div", { class: "count" },
+      `${goldFull(liquidGold)} liquid${state.networth.updated_at ? ` (updated ${ago(state.networth.updated_at)})` : " (not set)"} `
+      + `+ ${goldFull(holdingsValue)} in holdings ${totalLiveValue ? `(${positionsWithLivePrice}/${positions.length} at live price, rest at cost)` : "(cost basis - no live prices found)"}`),
+  ));
+
+  // Capital-at-risk
+  app.append(el("h3", { class: "section-h" }, "Capital at risk (open positions)"));
+  if (!positionRows.length) {
+    app.append(el("div", { class: "card" }, el("div", { class: "empty" }, "No open positions - everything logged as bought has also been logged as sold.")));
+  } else {
+    app.append(el("div", { class: "card table-wrap" }, el("table", {},
+      el("thead", {}, el("tr", {},
+        el("th", { class: "left" }, "Item"), el("th", {}, "Qty"), el("th", {}, "Avg cost"), el("th", {}, "Total cost"),
+        el("th", {}, "% of capital"), el("th", {}, "Live value"), el("th", {}, "Unrealized"))),
+      el("tbody", {}, ...positionRows.map((p) => {
+        const pct2 = totalCostBasis ? p.totalCost / totalCostBasis : 0;
+        const unrealized = p.live != null ? (p.live - p.avgCost) * p.qty : null;
+        return el("tr", {},
+          el("td", { class: "left" }, p.name, p.variant ? el("div", { class: "variant" }, p.variant) : null),
+          el("td", {}, p.qty),
+          el("td", {}, goldFull(p.avgCost)),
+          el("td", {}, goldFull(p.totalCost)),
+          el("td", {}, pct(pct2)),
+          el("td", {}, p.live != null ? goldFull(p.live) : el("span", { class: "muted" }, "—")),
+          el("td", { class: unrealized == null ? "muted" : unrealized >= 0 ? "pos" : "neg" }, unrealized != null ? goldFull(unrealized) : "no live price"));
+      })))));
+  }
+
+  // Realized P&L
+  app.append(el("h3", { class: "section-h" }, "Realized P&L"));
+  const totalRealized = realized.reduce((s, r) => s + r.profit, 0);
+  app.append(el("div", { class: "card goal-card" },
+    el("div", { class: "goal-top" },
+      el("div", {}, el("div", { class: "l" }, "Total realized"), el("div", { class: `v ${totalRealized >= 0 ? "pos" : "neg"}` }, goldFull(totalRealized))),
+      el("div", {}, el("div", { class: "l" }, "Closed flips"), el("div", { class: "v" }, realized.reduce((s, r) => s + r.soldQty, 0))),
+      el("div", {}, el("div", { class: "l" }, "Distinct items"), el("div", { class: "v" }, realized.length)),
+    )));
+  if (realized.length) {
+    app.append(el("div", { class: "card table-wrap" }, el("table", {},
+      el("thead", {}, el("tr", {}, el("th", { class: "left" }, "Item"), el("th", {}, "Sold qty"), el("th", {}, "Realized P&L"))),
+      el("tbody", {}, ...realized.sort((a, b) => b.profit - a.profit).map((r) => el("tr", {},
+        el("td", { class: "left" }, r.name, r.variant ? el("div", { class: "variant" }, r.variant) : null),
+        el("td", {}, r.soldQty),
+        el("td", { class: r.profit >= 0 ? "pos" : "neg" }, goldFull(r.profit))))))));
+  }
+
+  if (flagged.length) {
+    app.append(el("div", { class: "card empty" },
+      `${flagged.length} sell${flagged.length > 1 ? "s" : ""} had no matching logged buy for part of the quantity `
+      + "(item obtained another way, or logged out of order) - counted as pure profit against zero cost for that portion."));
   }
 }
 
@@ -745,10 +952,14 @@ function route() {
     openDetail(key.includes("|") ? key : `${key}|`);
     return;
   }
-  if (["spreads", "timing", "favorites", "ledger"].includes(h)) state.tab = h;
-  if (h === "ledger" && state.trades === null) {
+  if (["spreads", "timing", "favorites", "ledger", "holdings"].includes(h)) state.tab = h;
+  if ((h === "ledger" || h === "holdings") && state.trades === null) {
     state.trades = []; // avoid re-triggering while the fetch is in flight
     loadTrades().then(render).catch((e) => { state.trades = null; console.error(e); });
+  }
+  if (h === "holdings" && state.networth === null) {
+    state.networth = {}; // avoid re-triggering while the fetch is in flight
+    loadNetworth().then(render).catch((e) => { state.networth = null; console.error(e); });
   }
   state.detail = null;
   render();

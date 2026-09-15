@@ -1,5 +1,6 @@
 const ALLOWED_PREFIXES = ["latest/", "history/", "items.json", "bonuses.json"];
 const LEDGER_KEY = "ledger/trades.json";
+const NETWORTH_KEY = "ledger/networth.json";
 const MAX_TRADES = 20000; // sanity cap, not a realistic ceiling for personal use
 
 function json(data, status = 200) {
@@ -34,31 +35,30 @@ async function readData(request, env) {
   return new Response(body, { headers });
 }
 
-async function getLedger(env) {
-  const obj = await env.DATA.get(LEDGER_KEY);
-  if (!obj) return { trades: [], etag: null };
+async function getJsonObject(env, key, fallback) {
+  const obj = await env.DATA.get(key);
+  if (!obj) return { data: fallback, etag: null };
   const data = await obj.json();
   // R2Conditional wants the raw etag (obj.etag), not the HTTP-header-quoted
   // form (obj.httpEtag) - using the quoted one makes every conditional put fail.
-  return { trades: data.trades || [], etag: obj.etag };
+  return { data, etag: obj.etag };
 }
 
-async function putLedger(env, trades, etag) {
-  const body = JSON.stringify({ trades });
+async function putJsonObject(env, key, data, etag) {
   const opts = { httpMetadata: { contentType: "application/json" } };
   if (etag) opts.onlyIf = { etagMatches: etag };
-  return env.DATA.put(LEDGER_KEY, body, opts);
+  return env.DATA.put(key, JSON.stringify(data), opts);
 }
 
 // Read-modify-write with a conditional put so a rare concurrent write (e.g.
-// two tabs open) fails loudly and retries instead of silently losing a trade.
-async function withLedger(env, mutate) {
+// two tabs open) fails loudly and retries instead of silently losing a write.
+async function withJsonObject(env, key, fallback, mutate) {
   for (let attempt = 0; attempt < 5; attempt++) {
-    const { trades, etag } = await getLedger(env);
-    const result = mutate(trades);
+    const { data, etag } = await getJsonObject(env, key, fallback);
+    const result = mutate(data);
     if (result === null) return null; // mutate signalled "not found" etc.
     try {
-      await putLedger(env, trades, etag);
+      await putJsonObject(env, key, data, etag);
       return result;
     } catch (e) {
       if (attempt === 4) throw e;
@@ -75,8 +75,8 @@ const REQUIRED_TRADE_FIELDS = ["character", "realm", "item_id", "item_name", "ac
 
 async function handleLedger(request, env, id) {
   if (request.method === "GET") {
-    const { trades } = await getLedger(env);
-    return json({ trades });
+    const { data } = await getJsonObject(env, LEDGER_KEY, { trades: [] });
+    return json({ trades: data.trades || [] });
   }
 
   if (!requireToken(request, env)) {
@@ -114,9 +114,10 @@ async function handleLedger(request, env, id) {
     if (!Number.isFinite(trade.item_id) || !Number.isFinite(trade.unit_price) || trade.unit_price < 0) {
       return json({ error: "invalid numeric field" }, 400);
     }
-    const result = await withLedger(env, (trades) => {
-      if (trades.length >= MAX_TRADES) return null;
-      trades.push(trade);
+    const result = await withJsonObject(env, LEDGER_KEY, { trades: [] }, (data) => {
+      data.trades = data.trades || [];
+      if (data.trades.length >= MAX_TRADES) return null;
+      data.trades.push(trade);
       return trade;
     });
     if (result === null) return json({ error: "ledger full" }, 507);
@@ -124,14 +125,47 @@ async function handleLedger(request, env, id) {
   }
 
   if (request.method === "DELETE" && id) {
-    const result = await withLedger(env, (trades) => {
-      const idx = trades.findIndex((t) => t.id === id);
+    const result = await withJsonObject(env, LEDGER_KEY, { trades: [] }, (data) => {
+      const idx = (data.trades || []).findIndex((t) => t.id === id);
       if (idx === -1) return null;
-      trades.splice(idx, 1);
+      data.trades.splice(idx, 1);
       return true;
     });
     if (result === null) return json({ error: "not found" }, 404);
     return json({ deleted: id });
+  }
+
+  return json({ error: "method not allowed" }, 405);
+}
+
+async function handleNetworth(request, env) {
+  if (request.method === "GET") {
+    const { data } = await getJsonObject(env, NETWORTH_KEY, { liquid_gold: 0, updated_at: null });
+    return json(data);
+  }
+
+  if (!requireToken(request, env)) {
+    return json({ error: "unauthorized" }, 401);
+  }
+
+  if (request.method === "PUT") {
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return json({ error: "invalid json" }, 400);
+    }
+    const liquidGold = Number(body.liquid_gold);
+    if (!Number.isFinite(liquidGold) || liquidGold < 0) {
+      return json({ error: "liquid_gold must be a non-negative number" }, 400);
+    }
+    const record = { liquid_gold: Math.round(liquidGold), updated_at: new Date().toISOString() };
+    await withJsonObject(env, NETWORTH_KEY, {}, (data) => {
+      data.liquid_gold = record.liquid_gold;
+      data.updated_at = record.updated_at;
+      return record;
+    });
+    return json(record);
   }
 
   return json({ error: "method not allowed" }, 405);
@@ -144,6 +178,7 @@ export default {
     if (url.pathname === "/api/ledger") return handleLedger(request, env, null);
     const m = url.pathname.match(/^\/api\/ledger\/([^/]+)$/);
     if (m) return handleLedger(request, env, decodeURIComponent(m[1]));
+    if (url.pathname === "/api/networth") return handleNetworth(request, env);
     return env.ASSETS.fetch(request);
   },
 };
