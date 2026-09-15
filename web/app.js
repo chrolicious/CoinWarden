@@ -288,7 +288,7 @@ function itemCell(r) {
   const variant = variantLabel(r.variant, info.level);
   return el("td", { class: "item left" },
     info.icon ? whLink(r.item_id, r.variant, el("img", { src: info.icon, alt: "", loading: "lazy" })) : el("span", { style: "width:24px;height:24px" }),
-    el("div", {},
+    el("div", { class: "body" },
       el("div", { class: "name" }, whLink(r.item_id, r.variant, info.name)),
       variant ? el("div", { class: "variant" }, variant) : null,
       el("div", { class: "sub" }, [cap(info.quality), info.cls, info.slot ? slotLabel(info.slot) : "", info.level && !variant.startsWith("ilvl") ? `Item Level ${info.level}` : ""].filter(Boolean).join(" · "))));
