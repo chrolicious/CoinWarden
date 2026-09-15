@@ -88,8 +88,10 @@ function itemInfo(itemId, row) {
     named: Boolean(i.name || row?.name),
   };
 }
+function cap(s) { return s ? s.charAt(0).toUpperCase() + s.slice(1).toLowerCase() : s; }
+function titleCase(s) { return s.split(" ").map(cap).join(" "); }
 function slotLabel(slot) {
-  return slot.toLowerCase().replace(/_/g, " ").replace("non equip", "not equippable");
+  return titleCase(slot.replace(/_/g, " ").replace(/non equip/i, "not equippable"));
 }
 
 // ---------- variants ----------
@@ -202,11 +204,7 @@ async function load() {
   for (const it of items.items) state.items.set(it.item_id, it);
   state.bonuses = bonuses.bonuses || {};
   document.getElementById("meta").textContent = `updated ${ago(state.generatedAt)} · ${state.spreads.length} spreads · ${state.timing.length} timing flips`;
-  const realmsEl = document.getElementById("realms");
-  realmsEl.replaceChildren(...REALM_ORDER.flatMap((r, i) => [
-    el("span", { class: "dot", style: `background:${REALM_COLOR[r]}` }), r,
-    i < REALM_ORDER.length - 1 ? " · " : "",
-  ]));
+  document.getElementById("realms").textContent = REALM_ORDER.map(cap).join(" · ");
 }
 
 // ---------- filters ----------
@@ -264,10 +262,10 @@ function filterBar(kind, source) {
     select("Type", "itemClass", classes),
     select("Subtype", "itemSubclass", subclasses),
     select("Slot", "slot", slots, slotLabel),
-    select("Quality", "quality", QUALITY_ORDER.filter((q) => infos.some((i) => i.quality === q)), (q) => q.toLowerCase()),
+    select("Quality", "quality", QUALITY_ORDER.filter((q) => infos.some((i) => i.quality === q)), cap),
     num("Max buy (g)", "maxBuy", { step: 1000 }),
     num("Min net profit (g)", "minProfit", { step: 100 }),
-    num("Min EV/day (g)", "minScore", { step: 10 }),
+    num("Min profit/day (g)", "minScore", { step: 10 }),
     num("Min sales seen (7d)", "minSoldEvidence"),
     el("label", { class: "check" }, el("input", { type: "checkbox", checked: f.namedOnly ? "" : null, onchange: (e) => set("namedOnly", e.target.checked) }), "named items only"),
     el("button", { class: "reset", onclick: () => { for (const k of ["quality", "itemClass", "itemSubclass", "slot", "search"]) f[k] = ""; saveJSON("cw.filters", f); render(); } }, "clear"),
@@ -293,11 +291,11 @@ function itemCell(r) {
     el("div", {},
       el("div", { class: "name" }, whLink(r.item_id, r.variant, info.name)),
       variant ? el("div", { class: "variant" }, variant) : null,
-      el("div", { class: "sub" }, [info.quality.toLowerCase(), info.cls, info.slot ? slotLabel(info.slot) : "", info.level && !variant.startsWith("ilvl") ? `ilvl ${info.level}` : ""].filter(Boolean).join(" · "))));
+      el("div", { class: "sub" }, [cap(info.quality), info.cls, info.slot ? slotLabel(info.slot) : "", info.level && !variant.startsWith("ilvl") ? `Item Level ${info.level}` : ""].filter(Boolean).join(" · "))));
 }
 function realmCell(realm, price, listings) {
-  return el("td", {}, el("div", {}, el("span", { class: "dot", style: `background:${REALM_COLOR[realm] || "var(--muted)"}` }), goldFull(price)),
-    el("div", { class: "realm" }, `${realm} · ${listings} listed`));
+  return el("td", {}, el("div", {}, goldFull(price)),
+    el("div", { class: "realm" }, `${cap(realm)} · ${listings} listed`));
 }
 function table(kind, rows, columns) {
   const [sortKey, sortDir] = state.sort[kind];
@@ -320,8 +318,8 @@ function table(kind, rows, columns) {
 // built on; current ask is shown only as secondary context (it's a wish).
 function soldCell(r, showRealm) {
   return el("td", {},
-    el("div", {}, showRealm ? el("span", { class: "dot", style: `background:${REALM_COLOR[r.sell_realm] || "var(--muted)"}` }) : null,
-      `sold @ ${goldFull(r.sold_median_7d)}`),
+    el("div", {}, `Sold @ ${goldFull(r.sold_median_7d)}`),
+    showRealm ? el("div", { class: "realm" }, `on ${cap(r.sell_realm)}`) : null,
     el("div", { class: "realm" }, `${r.sold_7d}× in 7d · ask ${gold(r.current_ask)} x${r.sell_listings}`));
 }
 function evDayCell(r) {
@@ -338,16 +336,16 @@ const SPREAD_COLS = [
     cell: (r) => realmCell(r.buy_realm, r.buy_price, r.buy_listings) },
   { key: "sold_median_7d", label: "Sell on", hint: "The realm and price this exact variant actually sold for (median of the last 7 days), not the current asking price. The × count is how many confirmed sales back that number.",
     cell: (r) => soldCell(r, true) },
-  { key: "score_per_day", label: "EV / day locked", hint: "Expected profit per day your buy gold is tied up: (chance it sells within 48h × net profit) minus (chance it doesn't × deposit loss), divided by expected days-to-sell. This is what the list is sorted by.",
+  { key: "score_per_day", label: "Expected Profit / Day", hint: "Expected value per day your buy gold is tied up: (probability it sells within 48h × net profit) minus (probability it doesn't × deposit loss), divided by expected days-to-sell. “Expected” means probability-weighted, not a guess. This is what the list is sorted by.",
     cell: evDayCell },
-  { key: "net_profit", label: "Net if sold", hint: "Profit if the sale happens at the 7-day sold price, before weighting by the odds of that happening (see EV/day for the risk-adjusted number).",
+  { key: "net_profit", label: "Net if Sold", hint: "Profit if the sale happens at the 7-day sold price, before weighting by the odds of that happening (see Expected Profit / Day for the risk-adjusted number).",
     cell: riskCell },
   { key: "realm_count", label: "Realms", hint: "How many of the 5 tracked realms currently have any listing of this exact item variant.",
     cell: (r) => el("td", {}, r.realm_count) },
 ];
 const TIMING_COLS = [
   { key: "name", label: "Item", left: true, defaultDir: 1, cell: (r) => itemCell(r) },
-  { key: "realm_slug", label: "Realm", left: true, defaultDir: 1, cell: (r) => el("td", { class: "left" }, el("span", { class: "dot", style: `background:${REALM_COLOR[r.realm_slug]}` }), r.realm_slug) },
+  { key: "realm_slug", label: "Realm", left: true, defaultDir: 1, cell: (r) => el("td", { class: "left" }, cap(r.realm_slug)) },
   { key: "buy_price", label: "Buy now", hint: "Cheapest current listing on this realm.",
     cell: (r) => el("td", {}, goldFull(r.buy_price), el("div", { class: "realm" }, `${r.sell_listings} listed`)) },
   { key: "p50", label: "Normal ask (p50)", hint: "This variant's typical asking price on this realm (median over its trailing history) - what “priced below normal” is measured against.",
@@ -356,9 +354,9 @@ const TIMING_COLS = [
     cell: (r) => el("td", { class: "pos" }, pct(r.discount)) },
   { key: "sold_median_7d", label: "Sell (7d evidence)", hint: "What this variant actually sold for on this realm (median of the last 7 days) - the price used for profit, not the current ask.",
     cell: (r) => soldCell(r, false) },
-  { key: "score_per_day", label: "EV / day locked", hint: "Expected profit per day your buy gold is tied up: (chance it sells within 48h × net profit) minus (chance it doesn't × deposit loss), divided by expected days-to-sell. This is what the list is sorted by.",
+  { key: "score_per_day", label: "Expected Profit / Day", hint: "Expected value per day your buy gold is tied up: (probability it sells within 48h × net profit) minus (probability it doesn't × deposit loss), divided by expected days-to-sell. “Expected” means probability-weighted, not a guess. This is what the list is sorted by.",
     cell: evDayCell },
-  { key: "net_profit", label: "Net if sold", hint: "Profit if the sale happens at the 7-day sold price, before weighting by the odds of that happening (see EV/day for the risk-adjusted number).",
+  { key: "net_profit", label: "Net if Sold", hint: "Profit if the sale happens at the 7-day sold price, before weighting by the odds of that happening (see Expected Profit / Day for the risk-adjusted number).",
     cell: riskCell },
   { key: "turnover_events", label: "Turnover", hint: "Hour-to-hour listing-count drops in the lookback window - a rough liquidity signal.",
     cell: (r) => el("td", {}, r.turnover_events) },
@@ -367,8 +365,8 @@ const TIMING_COLS = [
 const FAV_COLS = [
   { key: "name", label: "Item", left: true, defaultDir: 1, cell: (r) => itemCell(r) },
   { key: "spread", label: "Best spread", cell: (r) => r.spread ? realmCell(r.spread.buy_realm, r.spread.buy_price, r.spread.buy_listings) : el("td", { class: "realm" }, "—") },
-  { key: "spread_net", label: "Spread EV/day", cell: (r) => el("td", { class: r.spread ? "pos" : "" }, r.spread ? `${goldFull(r.spread.score_per_day)}/d` : "—") },
-  { key: "timing_net", label: "Timing EV/day", cell: (r) => el("td", { class: r.timing ? "pos" : "" }, r.timing ? `${goldFull(r.timing.score_per_day)}/d on ${r.timing.realm_slug}` : "—") },
+  { key: "spread_net", label: "Spread Profit/Day", cell: (r) => el("td", { class: r.spread ? "pos" : "" }, r.spread ? `${goldFull(r.spread.score_per_day)}/d` : "—") },
+  { key: "timing_net", label: "Timing Profit/Day", cell: (r) => el("td", { class: r.timing ? "pos" : "" }, r.timing ? `${goldFull(r.timing.score_per_day)}/d on ${cap(r.timing.realm_slug)}` : "—") },
 ];
 
 // ---------- views ----------
@@ -432,7 +430,7 @@ function renderDetail() {
     info.icon ? whLink(itemId, variant, el("img", { src: info.icon, alt: "" })) : null,
     el("div", {}, el("h2", {}, whLink(itemId, variant, info.name), " ", starButton(key)),
       vlabel ? el("div", { class: "variant" }, vlabel) : null,
-      el("div", { class: "sub" }, [info.quality.toLowerCase(), info.cls, `item ${itemId}`].filter(Boolean).join(" · "))),
+      el("div", { class: "sub" }, [cap(info.quality), info.cls, `Item ${itemId}`].filter(Boolean).join(" · "))),
   ));
 
   if (history === null) { app.append(el("div", { class: "chart-empty" }, "loading history…")); return; }
@@ -445,7 +443,7 @@ function renderDetail() {
   const tiles = REALM_ORDER.filter((r) => latestByRealm.has(r)).map((realm) => {
     const r = latestByRealm.get(realm);
     return el("div", { class: "tile" },
-      el("div", { class: "l" }, el("span", { class: "dot", style: `background:${REALM_COLOR[realm]}` }), realm),
+      el("div", { class: "l" }, el("span", { class: "dot", style: `background:${REALM_COLOR[realm]}` }), cap(realm)),
       el("div", { class: "v" }, goldFull(r.min_unit_price)),
       el("div", { class: "d" }, `median ${goldFull(r.median_unit_price)} · ${r.listing_count} listed · ${ago(r.fetched_at)}`));
   });
@@ -467,7 +465,7 @@ function renderDetail() {
       const s = byRealm.get(realm);
       const med = s.medians.length ? s.medians.sort((a, b) => a - b)[Math.floor(s.medians.length / 2)] : null;
       return el("div", { class: "tile" },
-        el("div", { class: "l" }, el("span", { class: "dot", style: `background:${REALM_COLOR[realm]}` }), `${realm} sales · ${days} d`),
+        el("div", { class: "l" }, el("span", { class: "dot", style: `background:${REALM_COLOR[realm]}` }), `${cap(realm)} sales · ${days} d`),
         el("div", { class: "v" }, `${s.sold} sold`),
         el("div", { class: "d" }, [med ? `median ${goldFull(med)}` : "", `${s.relist} relists`, `${s.expired} expired`].filter(Boolean).join(" · ")));
     })));
@@ -549,10 +547,10 @@ function renderLedgerForm(app) {
       el("label", {}, "Character", el("input", { type: "text", required: "", value: f.character, maxlength: 64, "data-fkey": "ledger-character",
         oninput: (e) => setField("character", e.target.value) })),
       el("label", {}, "Realm", el("select", { onchange: (e) => setField("realm", e.target.value) },
-        ...REALM_ORDER.map((r) => el("option", { value: r, selected: f.realm === r ? "" : null }, r)))),
+        ...REALM_ORDER.map((r) => el("option", { value: r, selected: f.realm === r ? "" : null }, cap(r))))),
       el("label", {}, "Action", el("select", { onchange: (e) => setField("action", e.target.value) },
-        el("option", { value: "buy", selected: f.action === "buy" ? "" : null }, "buy"),
-        el("option", { value: "sell", selected: f.action === "sell" ? "" : null }, "sell"))),
+        el("option", { value: "buy", selected: f.action === "buy" ? "" : null }, "Buy"),
+        el("option", { value: "sell", selected: f.action === "sell" ? "" : null }, "Sell"))),
     ),
     itemField,
     el("div", { class: "ledger-row" },
@@ -566,7 +564,7 @@ function renderLedgerForm(app) {
     el("label", { class: "notes" }, "Notes (optional)", el("input", { type: "text", value: f.notes, maxlength: 256, "data-fkey": "ledger-notes",
       oninput: (e) => setField("notes", e.target.value) })),
     el("div", { class: "ledger-row" },
-      el("button", { type: "submit", class: "primary" }, `Log ${f.action}`),
+      el("button", { type: "submit", class: "primary" }, `Log ${cap(f.action)}`),
       el("span", { id: "ledger-form-error", class: "form-error" }),
     ),
   );
@@ -582,8 +580,8 @@ function renderLedgerTable(app) {
   const rows = trades.map((t) => el("tr", {},
     el("td", { class: "left" }, new Date(t.ts).toLocaleString()),
     el("td", { class: "left" }, t.character),
-    el("td", { class: "left" }, t.realm),
-    el("td", { class: t.action === "buy" ? "neg" : "pos" }, t.action),
+    el("td", { class: "left" }, cap(t.realm)),
+    el("td", { class: t.action === "buy" ? "neg" : "pos" }, cap(t.action)),
     el("td", { class: "left" }, t.item_name, t.variant ? el("div", { class: "variant" }, t.variant) : null),
     el("td", {}, goldFull(t.unit_price)),
     el("td", {}, t.quantity),
@@ -808,7 +806,7 @@ function chartCard(history) {
   const realms = REALM_ORDER.filter((r) => history.hourly.some((h) => h.realm_slug === r) || history.daily.some((d) => d.realm_slug === r));
   const legend = el("div", { class: "legend" }, ...realms.map((r) => el("label", { style: `color:${REALM_COLOR[r]}` },
     el("input", { type: "checkbox", checked: c.hidden.has(r) ? null : "", onchange: (e) => { if (e.target.checked) c.hidden.delete(r); else c.hidden.add(r); render(); } }),
-    el("span", { class: "key" }), el("span", { style: "color:var(--ink-2)" }, r))));
+    el("span", { class: "key" }), el("span", { style: "color:var(--ink-2)" }, cap(r)))));
   card.append(el("div", { class: "chart-controls" },
     seg(ranges.map(([id]) => [id, id]), c.range, (id) => { c.range = id; }),
     seg([["min", "Cheapest"], ["median", "Median"]], c.measure, (id) => { c.measure = id; }),
@@ -900,7 +898,7 @@ function lineChart(series) {
     for (const s of series) {
       const p = s.points.find((q) => q.t === best);
       if (!p) continue;
-      tip.append(el("div", { class: "row" }, el("span", {}, el("span", { class: "key", style: `background:${s.color}` }), s.realm), el("b", {}, `${goldFull(p.v * COPPER)} · ${p.n}`)));
+      tip.append(el("div", { class: "row" }, el("span", {}, el("span", { class: "key", style: `background:${s.color}` }), cap(s.realm)), el("b", {}, `${goldFull(p.v * COPPER)} · ${p.n}`)));
     }
     tip.style.display = "block";
     const left = (x(best) / W) * rect.width;
