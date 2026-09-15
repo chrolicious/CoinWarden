@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from core.config import Config
 from core.db import open_db
 from core.variants import bonus_ids
+from core.backtest import log as log_recommendations
 
 AH_CUT = 0.05
 COPPER_PER_GOLD = 10_000
@@ -318,6 +319,7 @@ def publish(conn: sqlite3.Connection, storage, fetched_at: str) -> None:
     timing = timing_flips(conn, **PUBLISH_TIMING)
     storage.put_json("latest/spreads.json", {"generated_at": fetched_at, "rows": spreads})
     storage.put_json("latest/timing.json", {"generated_at": fetched_at, "rows": timing})
+    logged = log_recommendations(conn, spreads, timing, fetched_at)
 
     items = _rows(conn, "SELECT item_id, name, quality, item_class, item_subclass, inventory_type, item_level, icon_url "
                         "FROM items WHERE name IS NOT NULL", [])
@@ -344,7 +346,8 @@ def publish(conn: sqlite3.Connection, storage, fetched_at: str) -> None:
                    for i, s in enumerate(shards)]
     storage.put_json_many(shard_files)
     print(f"published {len(spreads)} spreads, {len(timing)} timing flips, {len(items)} items, "
-          f"{bonus_count} bonus entries, {published} variant histories in {HISTORY_SHARDS} shards", flush=True)
+          f"{bonus_count} bonus entries, {published} variant histories in {HISTORY_SHARDS} shards, "
+          f"{logged} recommendations logged for backtesting", flush=True)
 
 
 def _gold(copper: int) -> str:

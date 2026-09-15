@@ -95,6 +95,26 @@ CREATE TABLE IF NOT EXISTS daily_sales (
 CREATE INDEX IF NOT EXISTS idx_daily_sales_item
     ON daily_sales (item_id, variant, day);
 
+CREATE TABLE IF NOT EXISTS recommendation_log (
+    fetched_at TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    item_id INTEGER NOT NULL,
+    variant TEXT NOT NULL DEFAULT '',
+    rank INTEGER NOT NULL,
+    buy_realm TEXT NOT NULL,
+    buy_price INTEGER NOT NULL,
+    sell_realm TEXT NOT NULL,
+    sold_median_7d INTEGER,
+    net_profit INTEGER NOT NULL,
+    score_per_day INTEGER NOT NULL,
+    p_sold_48h REAL NOT NULL,
+    days_to_sell REAL NOT NULL,
+    PRIMARY KEY (fetched_at, kind, item_id, variant)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_reclog_lookup
+    ON recommendation_log (kind, item_id, variant, fetched_at);
+
 CREATE TABLE IF NOT EXISTS featured_items (
     item_id INTEGER NOT NULL,
     variant TEXT NOT NULL DEFAULT '',
@@ -277,6 +297,7 @@ def prune(conn: sqlite3.Connection, hourly_cutoff_iso: str, daily_cutoff_day: st
         daily = conn.execute("DELETE FROM daily_item_prices WHERE day < ?", (daily_cutoff_day,)).rowcount
         conn.execute("DELETE FROM daily_sales WHERE day < ?", (daily_cutoff_day,))
         events = conn.execute("DELETE FROM sale_events WHERE vanished_at < ?", (events_cutoff_iso,)).rowcount
+        conn.execute("DELETE FROM recommendation_log WHERE fetched_at < ?", (events_cutoff_iso,))
     return hourly, daily, events
 
 
