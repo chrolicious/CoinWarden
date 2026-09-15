@@ -38,7 +38,9 @@ async function getLedger(env) {
   const obj = await env.DATA.get(LEDGER_KEY);
   if (!obj) return { trades: [], etag: null };
   const data = await obj.json();
-  return { trades: data.trades || [], etag: obj.httpEtag };
+  // R2Conditional wants the raw etag (obj.etag), not the HTTP-header-quoted
+  // form (obj.httpEtag) - using the quoted one makes every conditional put fail.
+  return { trades: data.trades || [], etag: obj.etag };
 }
 
 async function putLedger(env, trades, etag) {
