@@ -52,23 +52,39 @@ def ensure_schema(client: libsql_client.Client) -> None:
             client.execute(statement)
 
 
+# Runner-to-Turso latency dominates write time, so minimise HTTP round trips:
+# many rows per INSERT statement, many statements per batch request.
+ROWS_PER_STATEMENT = 250
+STATEMENTS_PER_BATCH = 20
+
+SNAPSHOT_COLUMNS = 8
+
+
+def _multi_row_insert(rows: list[tuple]) -> libsql_client.Statement:
+    placeholders = ", ".join(["(" + ", ".join(["?"] * SNAPSHOT_COLUMNS) + ")"] * len(rows))
+    sql = (
+        "INSERT INTO item_price_snapshots "
+        "(realm_slug, connected_realm_id, item_id, min_unit_price, median_unit_price, "
+        "listing_count, total_quantity, fetched_at) VALUES " + placeholders
+    )
+    args = [value for row in rows for value in row]
+    return libsql_client.Statement(sql, args)
+
+
 def insert_item_snapshots(client: libsql_client.Client, rows: list[tuple]) -> None:
     if not rows:
         return
 
-    statement = """
-        INSERT INTO item_price_snapshots
-            (realm_slug, connected_realm_id, item_id, min_unit_price, median_unit_price, listing_count, total_quantity, fetched_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """
-    batch = [libsql_client.Statement(statement, row) for row in rows]
+    statements = [
+        _multi_row_insert(rows[i : i + ROWS_PER_STATEMENT])
+        for i in range(0, len(rows), ROWS_PER_STATEMENT)
+    ]
 
-    total_batches = (len(batch) + 499) // 500
-    for batch_num, i in enumerate(range(0, len(batch), 500), start=1):
+    total_batches = (len(statements) + STATEMENTS_PER_BATCH - 1) // STATEMENTS_PER_BATCH
+    for batch_num, i in enumerate(range(0, len(statements), STATEMENTS_PER_BATCH), start=1):
         t0 = time.monotonic()
-        client.batch(batch[i : i + 500])
-        elapsed = time.monotonic() - t0
-        print(f"    batch {batch_num}/{total_batches} ({len(batch[i:i+500])} rows) in {elapsed:.2f}s", flush=True)
+        client.batch(statements[i : i + STATEMENTS_PER_BATCH])
+        print(f"    batch {batch_num}/{total_batches} in {time.monotonic() - t0:.2f}s", flush=True)
 
 
 def get_known_item_ids(client: libsql_client.Client) -> set[int]:
