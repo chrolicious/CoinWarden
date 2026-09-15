@@ -25,7 +25,9 @@ DROP TABLE IF EXISTS auction_snapshots;
 
 
 def get_client(config: Config) -> libsql_client.Client:
-    url = config.turso_database_url.replace("libsql://", "https://", 1)
+    raw = config.turso_database_url
+    url = raw.replace("libsql://", "https://", 1)
+    print(f"DEBUG db url repr: raw={raw!r} transformed={url!r}", flush=True)
     return libsql_client.create_client_sync(
         url=url,
         auth_token=config.turso_auth_token,
