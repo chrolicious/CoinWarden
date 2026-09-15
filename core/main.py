@@ -1,4 +1,6 @@
+import faulthandler
 import statistics
+import sys
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -57,10 +59,21 @@ def _rows_from_aggregates(realm_slug: str, connected_realm_id: int, aggregates: 
 
 
 def main():
+    faulthandler.dump_traceback_later(90, exit=True, file=sys.stderr)
+
+    print("creating config/client...", flush=True)
     config = Config()
     client = BattleNetClient(config)
+
+    print("connecting to DB...", flush=True)
+    t0 = time.monotonic()
     db = get_client(config)
+    print(f"  connected in {time.monotonic() - t0:.2f}s", flush=True)
+
+    print("ensuring schema...", flush=True)
+    t0 = time.monotonic()
     ensure_schema(db)
+    print(f"  schema ready in {time.monotonic() - t0:.2f}s", flush=True)
 
     fetched_at = datetime.now(timezone.utc).isoformat()
 
@@ -88,6 +101,7 @@ def main():
         print(f"  wrote {len(rows)} rows to DB in {time.monotonic() - t0:.2f}s", flush=True)
 
     db.close()
+    faulthandler.cancel_dump_traceback_later()
 
 
 if __name__ == "__main__":
