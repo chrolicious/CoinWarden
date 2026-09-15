@@ -5,6 +5,14 @@ compatibility_date = "2026-09-01"
 [triggers]
 crons = ["3 * * * *"]
 
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+invocation_logs = true
+
 [assets]
 directory = "web"
 binding = "ASSETS"
