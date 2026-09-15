@@ -19,4 +19,10 @@ Companion app + WoW addon for scanning connected-realm (non-commodity) and regio
 
 ## Status
 
-Scaffold only. Next: persist snapshots to DB, compute historical medians, flag underpriced listings.
+Hourly pipeline live (GitHub Actions cron → Turso): per-item price aggregates for 5 EU realms plus item metadata.
+
+`python -m core.scoring --help` — cross-realm spread opportunities from the latest snapshot. All thresholds are query-time parameters; raw snapshots are never filtered at ingest.
+
+Known limitation: without turnover history, the sell side cannot distinguish a real market price from an aspirational listing that never sells. A turnover signal (cheapest listing disappearing before it could expire) is planned once ~a week of snapshots exists.
+
+Next: timing-flip score, dashboard (GitHub Pages), ledger.
