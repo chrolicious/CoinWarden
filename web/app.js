@@ -1061,3 +1061,29 @@ window.addEventListener("hashchange", route);
 load().then(route).catch((e) => {
   document.getElementById("meta").textContent = `failed to load data: ${e.message}`;
 });
+
+// Hash routing never triggers a real page load, so a tab left open across a
+// deploy silently keeps running the old app.js. Poll app.js's ETag and show
+// a banner rather than relying on the user to remember to hard-refresh.
+(function watchForUpdates() {
+  let currentEtag = null;
+  async function check() {
+    try {
+      const r = await fetch("app.js", { method: "HEAD", cache: "no-store" });
+      const etag = r.headers.get("etag");
+      if (!etag) return;
+      if (currentEtag === null) { currentEtag = etag; return; }
+      if (etag !== currentEtag && !document.getElementById("update-banner")) {
+        const bar = el("div", { id: "update-banner", style:
+          "position:fixed;bottom:0;left:0;right:0;z-index:50;background:var(--accent);color:#fff;" +
+          "padding:10px 16px;display:flex;gap:12px;align-items:center;justify-content:center;font-size:13px;" },
+          "A new version of CoinWarden is available.",
+          el("button", { style: "background:#fff;color:var(--accent);border:0;border-radius:6px;padding:4px 12px;cursor:pointer;font-weight:600;",
+            onclick: () => location.reload() }, "Reload"));
+        document.body.append(bar);
+      }
+    } catch {}
+  }
+  check();
+  setInterval(check, 5 * 60 * 1000);
+})();
