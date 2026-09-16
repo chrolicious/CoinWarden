@@ -22,6 +22,22 @@ SALES_WINDOW_DAYS = 7
 DEPOSIT_RATE_48H = 0.10
 SELL_HORIZON_DAYS = 2.0
 
+# P(sold within the 2-day horizon), v1: an exponential curve driven by
+# days_to_sell (supply / sales-per-day). The backtest showed this was badly
+# miscalibrated (predicted 6-24%, actual 50-73%), and refitting its time
+# constant only got it from log-loss 1.21 to 0.91 - because days_to_sell
+# itself barely correlates with the real outcome (corr -0.02 over 16k logged
+# recommendations). We only ever recommend the cheapest listing to buy and an
+# aggressively undercut relist, so whether *that* sells in 48h is apparently
+# close to a constant, not something the current supply/demand ratio
+# predicts. A flat empirical base rate (measured separately per kind, since
+# timing dips sell faster than spread flips) beats the curve outright
+# (log-loss 0.69) and is the honest model given the features we log today.
+# Revisit if a genuinely predictive feature gets added (e.g. price vs current
+# best ask at recommendation time).
+P_SOLD_SPREAD = 0.56
+P_SOLD_TIMING = 0.61
+
 
 def _rows(conn: sqlite3.Connection, sql: str, params: list) -> list[dict]:
     cur = conn.execute(sql, params)
@@ -58,12 +74,16 @@ def ensure_latest_snapshot(conn: sqlite3.Connection) -> None:
 # Shared tail: from a `priced` CTE carrying buy_price, net_profit (profit if
 # the sale happens, already computed from a *realized* sold price - never the
 # current ask), sold_7d, sell_listings (current supply on the sell side) and
-# vendor_sell_price, derive expected days-to-sell, P(sale within the relist
-# horizon), the worst-case deposit loss, and rank by expected value per day
-# of capital locked - not raw profit, so illiquid/expensive-to-relist items
-# stop floating to the top on a big-but-unlikely number.
+# vendor_sell_price, derive expected days-to-sell (still used as the capital-
+# locked-per-day denominator - a continuous time estimate, not the same claim
+# as the binary p_sold_48h below), the worst-case deposit loss, and rank by
+# expected value per day of capital locked - not raw profit, so illiquid/
+# expensive-to-relist items stop floating to the top on a big-but-unlikely
+# number. p_sold_48h is injected as a flat literal per kind (see
+# P_SOLD_SPREAD / P_SOLD_TIMING above) rather than derived from days_to_sell.
 # Params: max_buy_copper, min_profit_copper, min_roi, max_roi, limit
-RISK_SCORE_SQL_TAIL = f"""
+def _risk_score_sql_tail(p_sold: float) -> str:
+    return f"""
 scored AS (
     SELECT *,
            ROUND(MAX(1.0 * sell_listings * {SALES_WINDOW_DAYS} / sold_7d, 0.1), 1) AS days_to_sell,
@@ -72,9 +92,8 @@ scored AS (
 ),
 final AS (
     SELECT *,
-           ROUND(1 - EXP(-{SELL_HORIZON_DAYS} / days_to_sell), 3) AS p_sold_48h,
-           CAST((1 - EXP(-{SELL_HORIZON_DAYS} / days_to_sell)) * net_profit
-                - EXP(-{SELL_HORIZON_DAYS} / days_to_sell) * deposit_estimate AS INTEGER) AS expected_value
+           {p_sold} AS p_sold_48h,
+           CAST({p_sold} * net_profit - (1 - {p_sold}) * deposit_estimate AS INTEGER) AS expected_value
     FROM scored
 )
 SELECT *, ROUND(1.0 * net_profit / buy_price, 2) AS roi,
@@ -95,7 +114,8 @@ LIMIT ?
 # price still needs to sit within a sane multiple of the cross-realm anchor
 # (median of the cheapest listing per realm) to filter obvious troll listings.
 # Params: min_sold_evidence, sanity_multiple, (RISK_SCORE_SQL_TAIL params)
-CROSS_REALM_SPREAD_SQL = f"""
+def _cross_realm_spread_sql(p_sold: float) -> str:
+    return f"""
 WITH latest AS (
     SELECT * FROM latest_snapshot
 ),
@@ -146,14 +166,14 @@ priced AS (
     FROM spread sp
     LEFT JOIN items i ON i.item_id = sp.item_id
 ),
-{RISK_SCORE_SQL_TAIL}
+{_risk_score_sql_tail(p_sold)}
 """
 
 
 def cross_realm_spreads(conn, min_sold_evidence: int, sanity_multiple: float, max_buy_gold: int,
                         min_profit_gold: int, min_roi: float, max_roi: float, limit: int) -> list[dict]:
     ensure_latest_snapshot(conn)
-    return _rows(conn, CROSS_REALM_SPREAD_SQL,
+    return _rows(conn, _cross_realm_spread_sql(P_SOLD_SPREAD),
                  [min_sold_evidence, sanity_multiple, max_buy_gold * COPPER_PER_GOLD,
                   min_profit_gold * COPPER_PER_GOLD, min_roi, max_roi, limit])
 
@@ -168,7 +188,8 @@ def cross_realm_spreads(conn, min_sold_evidence: int, sanity_multiple: float, ma
 # normal ask" item that nobody actually buys still won't rank highly.
 # Params: day_window_start, hourly_window_start, min_days, min_samples, min_turnover,
 #         min_discount, min_sold_evidence, (RISK_SCORE_SQL_TAIL params)
-TIMING_FLIP_SQL = f"""
+def _timing_flip_sql(p_sold: float) -> str:
+    return f"""
 WITH daily AS (
     SELECT connected_realm_id, item_id, variant, typical_price AS price, turnover_events
     FROM daily_item_prices
@@ -242,7 +263,7 @@ priced AS (
     FROM dip d
     LEFT JOIN items i ON i.item_id = d.item_id
 ),
-{RISK_SCORE_SQL_TAIL}
+{_risk_score_sql_tail(p_sold)}
 """
 
 
@@ -253,7 +274,7 @@ def timing_flips(conn, window_days: int, min_days: int, min_samples: int, min_tu
     day_window_start = (now - timedelta(days=window_days)).strftime("%Y-%m-%d")
     hourly_window_start = (now - timedelta(days=window_days)).isoformat()
     ensure_latest_snapshot(conn)
-    return _rows(conn, TIMING_FLIP_SQL,
+    return _rows(conn, _timing_flip_sql(P_SOLD_TIMING),
                  [day_window_start, hourly_window_start, min_days, min_days, min_days, min_days,
                   min_samples, min_turnover, min_sold_evidence, min_discount,
                   max_buy_gold * COPPER_PER_GOLD, min_profit_gold * COPPER_PER_GOLD, min_roi, max_roi, limit])
