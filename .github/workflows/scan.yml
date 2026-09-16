@@ -2,11 +2,14 @@ name: Hourly AH scan
 
 on:
   schedule:
-    # Primary slot plus a hedge: GitHub drops scheduled runs under load, and a
-    # gap of more than two hours between snapshots breaks sale detection. The
-    # hedge exits within seconds if a run already succeeded recently.
-    - cron: "5 * * * *"
-    - cron: "35 * * * *"
+    # GitHub can delay/drop scheduled runs under load - observed gaps up to
+    # ~6h with only 2 slots/hour. More slots raise the odds one actually
+    # fires; each is near-free when skipped (skip-if-recent exits in
+    # seconds). This does not fully solve platform-wide scheduling delays,
+    # since all schedule: triggers share the same queue - see the skip-if-
+    # recent step below for the real mitigation (gap-aware sale detection
+    # degrades gracefully rather than corrupting data when a gap happens).
+    - cron: "5,15,25,35,45,55 * * * *"
   workflow_dispatch:
     inputs:
       max_new_items:
