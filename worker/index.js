@@ -171,6 +171,31 @@ async function handleNetworth(request, env) {
   return json({ error: "method not allowed" }, 405);
 }
 
+// GitHub's own schedule: triggers can be delayed for hours platform-wide
+// under load - all of them share one queue, so more cron slots inside the
+// workflow don't help (confirmed live: a 6-slot hedge still saw a 5h25m
+// gap). workflow_dispatch is a different event category with none of that
+// queueing (confirmed: direct dispatch calls always fired within seconds),
+// so Cloudflare's own cron (independent infrastructure) pings it instead.
+// The workflow's own skip-if-recent step makes a redundant fire cheap.
+async function dispatchScan(env) {
+  if (!env.GITHUB_DISPATCH_TOKEN) {
+    console.log("no GITHUB_DISPATCH_TOKEN secret; skipping dispatch");
+    return;
+  }
+  const resp = await fetch("https://api.github.com/repos/chrolicious/CoinWarden/actions/workflows/scan.yml/dispatches", {
+    method: "POST",
+    headers: {
+      "authorization": `Bearer ${env.GITHUB_DISPATCH_TOKEN}`,
+      "accept": "application/vnd.github+json",
+      "user-agent": "coinwarden-worker",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ ref: "master" }),
+  });
+  console.log(`dispatch: ${resp.status}${resp.ok ? "" : " " + await resp.text()}`);
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -180,5 +205,8 @@ export default {
     if (m) return handleLedger(request, env, decodeURIComponent(m[1]));
     if (url.pathname === "/api/networth") return handleNetworth(request, env);
     return env.ASSETS.fetch(request);
+  },
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(dispatchScan(env));
   },
 };
