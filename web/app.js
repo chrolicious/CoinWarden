@@ -1087,4 +1087,3 @@ load().then(route).catch((e) => {
   check();
   setInterval(check, 5 * 60 * 1000);
 })();
-// build-check
