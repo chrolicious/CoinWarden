@@ -5,7 +5,51 @@ import requests
 from core.config import Config
 
 REQUEST_TIMEOUT = 30
-MAX_RETRIES = 3
+MAX_RETRIES = 6
+BACKOFF_CAP_SECONDS = 30
+
+
+def _retry_delay(attempt: int, resp: requests.Response) -> float:
+    """Exponential backoff (1, 2, 4, 8, 16, 30 capped), but Retry-After wins
+    when the server sends one - Blizzard's 429s usually do."""
+    retry_after = resp.headers.get("Retry-After")
+    if retry_after is not None:
+        try:
+            return max(float(retry_after), 0)
+        except ValueError:
+            pass
+    return min(2 ** attempt, BACKOFF_CAP_SECONDS)
+
+
+def _request_with_retry(method: str, url: str, **kwargs) -> requests.Response:
+    """Shared retry path for every outbound call: retries 429 and 5xx (both
+    Battle.net's API and its OAuth endpoint return these transiently) with
+    backoff, logs each retry so a run that recovers still leaves a trace of
+    what it recovered from, and raises on the final attempt's response."""
+    resp = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            resp = requests.request(method, url, timeout=REQUEST_TIMEOUT, **kwargs)
+        except (requests.ConnectionError, requests.Timeout) as e:
+            if attempt == MAX_RETRIES - 1:
+                raise
+            delay = min(2 ** attempt, BACKOFF_CAP_SECONDS)
+            print(f"  {method} {url} failed ({e.__class__.__name__}), "
+                  f"retry {attempt + 1}/{MAX_RETRIES} in {delay:.0f}s", flush=True)
+            time.sleep(delay)
+            continue
+
+        if resp.status_code == 429 or resp.status_code >= 500:
+            if attempt == MAX_RETRIES - 1:
+                break
+            delay = _retry_delay(attempt, resp)
+            print(f"  {method} {url} -> {resp.status_code}, "
+                  f"retry {attempt + 1}/{MAX_RETRIES} in {delay:.0f}s", flush=True)
+            time.sleep(delay)
+            continue
+        return resp
+
+    return resp
 
 
 class BattleNetClient:
@@ -18,19 +62,12 @@ class BattleNetClient:
         if self._token and time.time() < self._token_expires_at:
             return self._token
 
-        resp = None
-        for attempt in range(MAX_RETRIES):
-            resp = requests.post(
-                f"https://{self.config.region}.battle.net/oauth/token",
-                data={"grant_type": "client_credentials"},
-                auth=(self.config.client_id, self.config.client_secret),
-                timeout=REQUEST_TIMEOUT,
-            )
-            if resp.status_code == 429 or resp.status_code >= 500:
-                if attempt < MAX_RETRIES - 1:
-                    time.sleep(2 ** attempt)
-                continue
-            break
+        resp = _request_with_retry(
+            "POST",
+            f"https://{self.config.region}.battle.net/oauth/token",
+            data={"grant_type": "client_credentials"},
+            auth=(self.config.client_id, self.config.client_secret),
+        )
         resp.raise_for_status()
         payload = resp.json()
         self._token = payload["access_token"]
@@ -43,21 +80,14 @@ class BattleNetClient:
         if extra_params:
             params.update(extra_params)
 
-        for attempt in range(MAX_RETRIES):
-            resp = requests.get(
-                f"https://{self.config.region}.api.blizzard.com{path}",
-                params=params,
-                headers={"Authorization": f"Bearer {self._get_token()}"},
-                timeout=REQUEST_TIMEOUT,
-            )
-            if resp.status_code == 404:
-                return None
-            if resp.status_code == 429 or resp.status_code >= 500:
-                time.sleep(2 ** attempt)
-                continue
-            resp.raise_for_status()
-            return resp.json()
-
+        resp = _request_with_retry(
+            "GET",
+            f"https://{self.config.region}.api.blizzard.com{path}",
+            params=params,
+            headers={"Authorization": f"Bearer {self._get_token()}"},
+        )
+        if resp.status_code == 404:
+            return None
         resp.raise_for_status()
         return resp.json()
 
