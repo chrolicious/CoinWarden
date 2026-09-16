@@ -54,15 +54,17 @@
 
   .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
   .table-wrap { overflow-x: auto; }
-  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  table { width: 100%; min-width: 920px; border-collapse: collapse; font-variant-numeric: tabular-nums; table-layout: fixed; }
   th, td { padding: 8px 10px; text-align: right; border-bottom: 1px solid var(--grid); white-space: nowrap; vertical-align: top; }
   th { color: var(--ink-2); font-weight: 600; font-size: 12px; cursor: pointer; user-select: none; position: sticky; top: 0; background: var(--surface); }
   th.sorted::after { content: " ▾"; color: var(--muted); }
   th.sorted.asc::after { content: " ▴"; }
   th:first-child, td:first-child, th.left, td.left { text-align: left; }
+  th:nth-child(1), td:nth-child(1) { width: 30px; }
+  th:nth-child(2), td:nth-child(2) { width: 260px; }
   tbody tr { cursor: pointer; }
   tbody tr:hover { background: var(--hover); }
-  td.item { display: flex; align-items: flex-start; gap: 8px; min-width: 240px; max-width: 320px; white-space: normal; min-height: 72px; }
+  td.item { display: flex; align-items: flex-start; gap: 8px; white-space: normal; min-height: 72px; }
   td.item img { width: 24px; height: 24px; border-radius: 4px; background: var(--grid); flex: none; display: block; margin-top: 1px; }
   td.item a.wh:has(img), .detail-head a.wh:has(img) { flex: none; line-height: 0; }
   td.item .body { min-width: 0; }
