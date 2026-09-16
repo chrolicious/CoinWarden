@@ -317,10 +317,14 @@ function table(kind, rows, columns) {
 // Sold-side cell: the realized 7d sold median is the number the ranking is
 // built on; current ask is shown only as secondary context (it's a wish).
 function soldCell(r, showRealm) {
+  // current_ask only exists on spread rows (the sell-realm's cheapest current
+  // listing); timing rows already show that same number in the "Buy now"
+  // column, so it's omitted there instead of rendering "ask NaN".
+  const askPart = showRealm ? ` · ask ${gold(r.current_ask)} x${r.sell_listings}` : "";
   return el("td", {},
     el("div", {}, `Sold @ ${goldFull(r.sold_median_7d)}`),
     showRealm ? el("div", { class: "realm" }, `on ${cap(r.sell_realm)}`) : null,
-    el("div", { class: "realm" }, `${r.sold_7d}× in 7d · ask ${gold(r.current_ask)} x${r.sell_listings}`));
+    el("div", { class: "realm" }, `${r.sold_7d}× in 7d${askPart}`));
 }
 function evDayCell(r) {
   return el("td", { class: r.score_per_day > 0 ? "pos" : "neg" }, goldFull(r.score_per_day) + "/d",
