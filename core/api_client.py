@@ -18,12 +18,19 @@ class BattleNetClient:
         if self._token and time.time() < self._token_expires_at:
             return self._token
 
-        resp = requests.post(
-            f"https://{self.config.region}.battle.net/oauth/token",
-            data={"grant_type": "client_credentials"},
-            auth=(self.config.client_id, self.config.client_secret),
-            timeout=REQUEST_TIMEOUT,
-        )
+        resp = None
+        for attempt in range(MAX_RETRIES):
+            resp = requests.post(
+                f"https://{self.config.region}.battle.net/oauth/token",
+                data={"grant_type": "client_credentials"},
+                auth=(self.config.client_id, self.config.client_secret),
+                timeout=REQUEST_TIMEOUT,
+            )
+            if resp.status_code == 429 or resp.status_code >= 500:
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(2 ** attempt)
+                continue
+            break
         resp.raise_for_status()
         payload = resp.json()
         self._token = payload["access_token"]
