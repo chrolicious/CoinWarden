@@ -3,7 +3,7 @@ main = "worker/index.js"
 compatibility_date = "2026-09-01"
 
 [triggers]
-crons = ["3 * * * *"]
+crons = ["* * * * *"] # TEMP: every-minute for live testing, reverting to hourly once confirmed
 
 [observability]
 enabled = true
