@@ -57,8 +57,8 @@ buy_check AS (
     FROM candidates c
     JOIN item_price_snapshots s
       ON s.realm_slug = c.buy_realm AND s.item_id = c.item_id AND s.variant = c.variant
-     AND s.fetched_at > c.fetched_at
-     AND s.fetched_at <= datetime(c.fetched_at, ?)
+     AND julianday(s.fetched_at) > julianday(c.fetched_at)
+     AND julianday(s.fetched_at) <= julianday(c.fetched_at) + ?
     GROUP BY c.fetched_at, c.kind, c.item_id, c.variant
 ),
 sell_check AS (
@@ -68,8 +68,8 @@ sell_check AS (
     FROM candidates c
     JOIN sale_events e
       ON e.realm_slug = c.sell_realm AND e.item_id = c.item_id AND e.variant = c.variant AND e.kind = 'sold'
-     AND e.vanished_at > c.fetched_at
-     AND e.vanished_at <= datetime(c.fetched_at, ?)
+     AND julianday(e.vanished_at) > julianday(c.fetched_at)
+     AND julianday(e.vanished_at) <= julianday(c.fetched_at) + ?
     GROUP BY c.fetched_at, c.kind, c.item_id, c.variant
 )
 SELECT c.*, b.next_min_price, sc.first_sold_at, sc.first_sold_price
@@ -86,7 +86,7 @@ def evaluate(conn: sqlite3.Connection, min_age_hours: float, sell_horizon_days: 
     window_start = window_start_iso or "2000-01-01"
     cur = conn.execute(
         EVALUATE_SQL,
-        [window_start, window_end, f"+{BUY_WINDOW_MINUTES} minutes", f"+{sell_horizon_days} days"],
+        [window_start, window_end, BUY_WINDOW_MINUTES / 1440.0, float(sell_horizon_days)],
     )
     cols = [c[0] for c in cur.description]
     rows = [dict(zip(cols, row)) for row in cur.fetchall()]
