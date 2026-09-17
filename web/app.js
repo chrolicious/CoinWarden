@@ -1,7 +1,9 @@
 "use strict";
 
 const COPPER = 10_000;
-const GOAL_GOLD = 7_000_000;
+const GOAL_GOLD = 10_000_000;
+const GOAL_MONTHS = 12;
+const MONTHLY_TARGET_GOLD = Math.round(GOAL_GOLD / GOAL_MONTHS);
 const PAGE_SIZE = 100;
 const HISTORY_SHARDS = 256;
 const REALM_ORDER = ["ravencrest", "frostmane", "darkspear", "silvermoon", "sylvanas"];
@@ -27,6 +29,7 @@ const state = {
   chart: { range: "7d", measure: "min", hidden: new Set() },
   trades: null,
   networth: null,
+  gameEvents: null,
   ledgerForm: Object.assign({ character: "", realm: REALM_ORDER[0], action: "buy", itemQuery: "",
     selectedItem: null, variant: "", price: "", quantity: 1, notes: "" }, loadJSON("cw.ledgerFormDefaults", {})),
 };
@@ -180,6 +183,12 @@ async function loadNetworth() {
   const r = await fetch("api/networth", { cache: "no-cache" });
   if (!r.ok) throw new Error(`networth: ${r.status}`);
   state.networth = await r.json();
+}
+async function loadGameEvents() {
+  const r = await fetch("api/game/events", { cache: "no-cache" });
+  if (!r.ok) throw new Error(`game events: ${r.status}`);
+  const data = await r.json();
+  state.gameEvents = data.events.filter((e) => e.type === "gold_delta");
 }
 async function saveLiquidGold(goldValue) {
   const token = getLedgerToken();
@@ -727,6 +736,55 @@ function computeGoalSummary() {
     liquidGold, holdingsValue, netWorth, goalCopper, progress, totalRealized };
 }
 
+// Cumulative gold made/spent, all characters combined and per-character,
+// from the addon's categorized gold_delta event stream - no separate
+// net-worth-snapshot history needed, since summing deltas from a known
+// starting point reconstructs the same curve.
+function computeMonthlyProgress(events) {
+  if (!events || !events.length) return null;
+  const sorted = events.slice().sort((a, b) => a.ts - b.ts);
+  const startT = sorted[0].ts * 1000;
+  const endT = Date.now();
+  const byChar = new Map();
+  let totalCum = 0;
+  const totalPts = [{ t: startT, v: 0 }];
+  for (const e of sorted) {
+    const t = e.ts * 1000;
+    totalCum += e.delta;
+    totalPts.push({ t, v: totalCum / COPPER });
+    const c = byChar.get(e.character) || { cum: 0, pts: [{ t: startT, v: 0 }] };
+    c.cum += e.delta;
+    c.pts.push({ t, v: c.cum / COPPER });
+    byChar.set(e.character, c);
+  }
+  const monthMs = 30 * 86400000;
+  const targetEnd = (MONTHLY_TARGET_GOLD * (endT - startT)) / monthMs / COPPER;
+  const colors = ["var(--s2)", "var(--s3)", "var(--s4)", "var(--s5)", "var(--accent)"];
+  const charSeries = [...byChar.entries()].map(([name, c], i) => ({
+    realm: name, color: colors[i % colors.length], points: c.pts,
+  }));
+  return {
+    series: [
+      { realm: "Total (all characters)", color: "var(--good)", points: totalPts },
+      { realm: "Target pace", color: "var(--muted)", points: [{ t: startT, v: 0 }, { t: endT, v: targetEnd }] },
+      ...charSeries,
+    ],
+  };
+}
+
+function progressCard() {
+  const progress = computeMonthlyProgress(state.gameEvents);
+  const card = el("div", { class: "card chart-card" });
+  if (!progress) {
+    card.append(el("div", { class: "chart-empty" }, "No tracked activity yet - the addon needs a bit of play time before this fills in."));
+    return card;
+  }
+  const legend = el("div", { class: "legend" }, ...progress.series.map((s) =>
+    el("span", { style: `color:${s.color}` }, el("span", { class: "key" }), el("span", { style: "color:var(--ink-2)" }, s.realm))));
+  card.append(legend, lineChart(progress.series));
+  return card;
+}
+
 function goalCard(g) {
   return el("div", { class: "card goal-card" },
     el("div", { class: "goal-top" },
@@ -737,7 +795,10 @@ function goalCard(g) {
     el("div", { class: "goal-bar" }, el("div", { class: "goal-fill", style: `width:${(g.progress * 100).toFixed(1)}%` })),
     el("div", { class: "count" },
       `${goldFull(g.liquidGold)} liquid${state.networth?.updated_at ? ` (updated ${ago(state.networth.updated_at)})` : " (not set)"} `
-      + `+ ${goldFull(g.holdingsValue)} in holdings ${g.totalLiveValue ? `(${g.positionsWithLivePrice}/${g.positions.length} at live price, rest at cost)` : "(cost basis - no live prices found)"}`));
+      + `+ ${goldFull(g.holdingsValue)} in holdings ${g.totalLiveValue ? `(${g.positionsWithLivePrice}/${g.positions.length} at live price, rest at cost)` : "(cost basis - no live prices found)"}`),
+    el("div", { class: "count" },
+      `Pace: ${goldFull(MONTHLY_TARGET_GOLD)}/month for ${GOAL_MONTHS} months to hit the goal `
+      + `- linear target, doesn't account for growth compounding as capital increases.`));
 }
 
 function renderHoldings(app) {
@@ -837,6 +898,9 @@ function renderDashboard(app) {
 
   app.append(el("h3", { class: "section-h" }, "Goal"));
   app.append(goalCard(g));
+
+  app.append(el("h3", { class: "section-h" }, "Progress this run"));
+  app.append(progressCard());
 
   const topSpreads = sortRows(state.spreads, ["score_per_day", -1]).slice(0, 5);
   const topTiming = sortRows(state.timing, ["score_per_day", -1]).slice(0, 5);
@@ -1053,6 +1117,10 @@ function route() {
   if ((state.tab === "holdings" || state.tab === "dashboard") && state.networth === null) {
     state.networth = {}; // avoid re-triggering while the fetch is in flight
     loadNetworth().then(render).catch((e) => { state.networth = null; console.error(e); });
+  }
+  if (state.tab === "dashboard" && state.gameEvents === null) {
+    state.gameEvents = []; // avoid re-triggering while the fetch is in flight
+    loadGameEvents().then(render).catch((e) => { state.gameEvents = null; console.error(e); });
   }
   state.detail = null;
   render();

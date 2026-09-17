@@ -9,6 +9,7 @@ Windows Scheduled Task is a later step once this is proven reliable.
 import glob
 import json
 import os
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -21,7 +22,19 @@ load_dotenv()
 
 DASHBOARD_URL = os.environ.get("COINWARDEN_DASHBOARD_URL", "https://coinwarden.epe-michel.workers.dev").rstrip("/")
 SYNC_TOKEN = os.environ.get("COINWARDEN_SYNC_TOKEN")
-CURSOR_PATH = Path(os.environ.get("COINWARDEN_DATA_DIR", "data")) / "addon_sync_cursor.json"
+DATA_DIR = Path(os.environ.get("COINWARDEN_DATA_DIR", "data"))
+CURSOR_PATH = DATA_DIR / "addon_sync_cursor.json"
+LOG_PATH = DATA_DIR / "addon_sync.log"
+
+# Under pythonw.exe (used by the Scheduled Task so no console window flashes
+# every 15 minutes) sys.stdout/stderr are None - print() would crash. Route
+# both to a log file in that case; a manual `python -m core.addon_sync` run
+# still prints normally since a real console has stdout.
+if sys.stdout is None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    _log_file = open(LOG_PATH, "a", encoding="utf-8")
+    sys.stdout = _log_file
+    sys.stderr = _log_file
 
 DEFAULT_SAVEDVARS_GLOB = str(
     Path("C:/Program Files (x86)/World of Warcraft/_retail_/WTF/Account/*/SavedVariables/CoinWarden.lua")
@@ -79,12 +92,14 @@ def push_state(character: str, char_data: dict) -> None:
         "class": char_data.get("class"),
         "gold": char_data.get("gold"),
         "gold_updated_at": _epoch_to_iso(char_data.get("gold_updated_at")),
+        "warband_gold": char_data.get("warband_gold"),
+        "warband_gold_updated_at": _epoch_to_iso(char_data.get("warband_gold_updated_at")),
         "auctions": auctions,
         "auctions_updated_at": _epoch_to_iso(char_data.get("auctions_updated_at")),
     }
     resp = requests.put(f"{DASHBOARD_URL}/api/game/state", headers=_headers(), json=body, timeout=30)
     resp.raise_for_status()
-    print(f"  state: gold={body['gold']}, {len(auctions)} owned auctions")
+    print(f"  state: gold={body['gold']}, warband={body['warband_gold']}, {len(auctions)} owned auctions")
 
 
 def push_events(character: str, events: list[dict], since_ts: int) -> int:
@@ -103,6 +118,9 @@ def push_events(character: str, events: list[dict], since_ts: int) -> int:
             "quantity": e.get("quantity"),
             "ah_cut": e.get("ah_cut"),
             "deposit": e.get("deposit"),
+            # gold_delta events only:
+            "delta": e.get("delta"),
+            "category": e.get("category"),
         }
         for e in new_events
     ]
@@ -117,6 +135,7 @@ def main() -> None:
     if not SYNC_TOKEN:
         raise SystemExit("COINWARDEN_SYNC_TOKEN is not set in .env - same value as the Worker's LEDGER_WRITE_TOKEN.")
 
+    print(f"--- {datetime.now(timezone.utc).isoformat()} ---")
     savedvars_path = _find_savedvars()
     print(f"reading {savedvars_path}")
     data = _parse_savedvars(savedvars_path)

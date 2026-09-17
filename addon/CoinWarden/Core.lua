@@ -51,6 +51,22 @@ local function snapshotGold()
     char.gold_updated_at = nowTS()
 end
 
+-- Best-effort: Warband Bank gold isn't visible to GetMoney() (that's
+-- character-only). C_Bank is the real namespace for the account-wide bank
+-- added with Warband Bank, but the exact function name/args below aren't
+-- verified against a live client - if this errors, snapshotWarbandGold
+-- silently no-ops (caller wraps in pcall) rather than breaking the addon,
+-- and the first /coinwarden dump after visiting the bank will show whether
+-- it worked.
+local function snapshotWarbandGold()
+    if not (C_Bank and C_Bank.FetchDepositedMoney and Enum.BankType) then
+        return
+    end
+    local char = ensureCharacter()
+    char.warband_gold = C_Bank.FetchDepositedMoney(Enum.BankType.Account)
+    char.warband_gold_updated_at = nowTS()
+end
+
 local function snapshotOwnedAuctions()
     if not (C_AuctionHouse and C_AuctionHouse.GetOwnedAuctions) then
         return
@@ -103,35 +119,131 @@ local function scanMailInvoices()
     end
 end
 
+-- Every gold change gets categorized and logged as its own event, so the
+-- dashboard can build a real income/expense breakdown instead of just a
+-- net-worth line. Categories, in priority order when several could apply:
+--   quest_reward - exact, from QUEST_TURNED_IN's own moneyReward arg
+--   repair       - exact, from hooking RepairAllItems/RepairItem
+--   ah_related   - AH frame or mailbox was open; the precise transaction is
+--                  already logged separately via scanMailInvoices/owned
+--                  auctions, so this exists only to keep it OUT of "other"
+--   vendor_sell/vendor_buy - merchant window was open (direction from sign)
+--   loot         - loot window was open
+--   other        - none of the above; genuinely uncategorized (world quest
+--                  currency vendors, misc NPC interactions, etc.)
+local lastGold
+local pendingQuestReward = false
+local pendingRepair = false
+local auctionHouseOpen, mailOpen, merchantOpen, lootOpen = false, false, false, false
+
+local function handleMoneyChange()
+    local char = ensureCharacter()
+    local newGold = GetMoney()
+    if lastGold == nil then
+        lastGold = newGold
+        snapshotGold()
+        return
+    end
+    local delta = newGold - lastGold
+    lastGold = newGold
+    snapshotGold()
+    if delta == 0 then return end
+
+    local category
+    if pendingQuestReward then
+        category = "quest_reward"
+    elseif pendingRepair then
+        category = "repair"
+    elseif auctionHouseOpen or mailOpen then
+        category = "ah_related"
+    elseif merchantOpen then
+        category = delta > 0 and "vendor_sell" or "vendor_buy"
+    elseif lootOpen then
+        category = "loot"
+    else
+        category = "other"
+    end
+    pendingQuestReward, pendingRepair = false, false
+    pushEvent("gold_delta", { delta = delta, category = category })
+end
+
+if RepairAllItems then
+    hooksecurefunc("RepairAllItems", function() pendingRepair = true end)
+end
+if RepairItem then
+    hooksecurefunc("RepairItem", function() pendingRepair = true end)
+end
+
 f:RegisterEvent("ADDON_LOADED")
 f:RegisterEvent("PLAYER_LOGIN")
 f:RegisterEvent("PLAYER_MONEY")
 f:RegisterEvent("MAIL_SHOW")
+f:RegisterEvent("MAIL_CLOSED")
 f:RegisterEvent("MAIL_INBOX_UPDATE")
 f:RegisterEvent("AUCTION_HOUSE_SHOW")
+f:RegisterEvent("AUCTION_HOUSE_CLOSED")
 f:RegisterEvent("OWNED_AUCTIONS_UPDATED")
+f:RegisterEvent("MERCHANT_SHOW")
+f:RegisterEvent("MERCHANT_CLOSED")
+f:RegisterEvent("LOOT_OPENED")
+f:RegisterEvent("LOOT_CLOSED")
+f:RegisterEvent("QUEST_TURNED_IN")
+f:RegisterEvent("BANKFRAME_OPENED")
+f:RegisterEvent("PLAYERBANKSLOTS_CHANGED")
 
-f:SetScript("OnEvent", function(self, event, arg1, ...)
+f:SetScript("OnEvent", function(self, event, arg1, arg2, arg3)
     if event == "ADDON_LOADED" then
         if arg1 ~= ADDON_NAME then return end
         playerKey = UnitName("player") .. "-" .. GetRealmName()
         realmName = GetRealmName()
         ensureCharacter()
+        lastGold = GetMoney()
         snapshotGold()
     elseif event == "PLAYER_LOGIN" then
+        lastGold = GetMoney()
         snapshotGold()
     elseif event == "PLAYER_MONEY" then
-        snapshotGold()
-    elseif event == "MAIL_SHOW" or event == "MAIL_INBOX_UPDATE" then
+        handleMoneyChange()
+    elseif event == "MAIL_SHOW" then
+        mailOpen = true
         local ok, err = pcall(scanMailInvoices)
-        if not ok then
-            pushEvent("_error", { context = "scanMailInvoices", err = tostring(err) })
-        end
-    elseif event == "AUCTION_HOUSE_SHOW" or event == "OWNED_AUCTIONS_UPDATED" then
+        if not ok then pushEvent("_error", { context = "scanMailInvoices", err = tostring(err) }) end
+    elseif event == "MAIL_INBOX_UPDATE" then
+        local ok, err = pcall(scanMailInvoices)
+        if not ok then pushEvent("_error", { context = "scanMailInvoices", err = tostring(err) }) end
+    elseif event == "MAIL_CLOSED" then
+        mailOpen = false
+    elseif event == "AUCTION_HOUSE_SHOW" then
+        auctionHouseOpen = true
         local ok, err = pcall(snapshotOwnedAuctions)
-        if not ok then
-            pushEvent("_error", { context = "snapshotOwnedAuctions", err = tostring(err) })
+        if not ok then pushEvent("_error", { context = "snapshotOwnedAuctions", err = tostring(err) }) end
+    elseif event == "OWNED_AUCTIONS_UPDATED" then
+        local ok, err = pcall(snapshotOwnedAuctions)
+        if not ok then pushEvent("_error", { context = "snapshotOwnedAuctions", err = tostring(err) }) end
+    elseif event == "AUCTION_HOUSE_CLOSED" then
+        auctionHouseOpen = false
+    elseif event == "MERCHANT_SHOW" then
+        merchantOpen = true
+    elseif event == "MERCHANT_CLOSED" then
+        merchantOpen = false
+    elseif event == "LOOT_OPENED" then
+        lootOpen = true
+    elseif event == "LOOT_CLOSED" then
+        lootOpen = false
+    elseif event == "QUEST_TURNED_IN" then
+        -- Signature assumed as (questID, xpReward, moneyReward) - not yet
+        -- confirmed live. If pendingQuestReward never actually triggers on
+        -- a real quest turn-in with a gold reward, the delta will just fall
+        -- through to "other" instead - harmless, just less precise than
+        -- intended. Check with /coinwarden dump after turning in a quest
+        -- that pays gold.
+        local moneyReward = arg3
+        if moneyReward and moneyReward > 0 then
+            pendingQuestReward = true
         end
+    elseif event == "BANKFRAME_OPENED" or event == "PLAYERBANKSLOTS_CHANGED" then
+        local ok, err = pcall(snapshotWarbandGold)
+        if not ok then pushEvent("_error", { context = "snapshotWarbandGold", err = tostring(err) }) end
     end
 end)
 
@@ -155,11 +267,13 @@ SlashCmdList["COINWARDEN"] = function(msg)
     elseif cmd == "reset" then
         char.events = {}
         char.seenInvoices = {}
+        lastGold = GetMoney()
         print("|cff33ff99CoinWarden|r events cleared")
     else
         local auctionCount = 0
         for _ in pairs(char.auctions or {}) do auctionCount = auctionCount + 1 end
-        print(("|cff33ff99CoinWarden|r gold=%dg auctions=%d events=%d"):format(
-            (char.gold or 0) / 10000, auctionCount, #char.events))
+        local warband = char.warband_gold and (" warband=%dg"):format(char.warband_gold / 10000) or " warband=unconfirmed"
+        print(("|cff33ff99CoinWarden|r gold=%dg auctions=%d events=%d%s"):format(
+            (char.gold or 0) / 10000, auctionCount, #char.events, warband))
     end
 end

@@ -201,6 +201,8 @@ async function handleGameState(request, env) {
         class: body.class || null,
         gold: Number.isFinite(Number(body.gold)) ? Math.round(Number(body.gold)) : null,
         gold_updated_at: body.gold_updated_at || null,
+        warband_gold: Number.isFinite(Number(body.warband_gold)) ? Math.round(Number(body.warband_gold)) : null,
+        warband_gold_updated_at: body.warband_gold_updated_at || null,
         auctions: body.auctions || {},
         auctions_updated_at: body.auctions_updated_at || null,
         synced_at: new Date().toISOString(),
@@ -217,7 +219,7 @@ async function handleGameState(request, env) {
 // Dedup key mirrors the addon's own per-mail dedup so a re-synced overlap
 // (sync script re-reading events it already sent) never double-counts.
 function eventKey(e) {
-  return [e.character, e.ts, e.type, e.item_name, e.price_copper, e.quantity].join("|");
+  return [e.character, e.ts, e.type, e.item_name, e.price_copper, e.quantity, e.delta, e.category].join("|");
 }
 
 async function handleGameEvents(request, env) {
@@ -288,8 +290,23 @@ async function dispatchScan(env) {
   console.log(`dispatch: ${resp.status}${resp.ok ? "" : " " + await resp.text()}`);
 }
 
+// Single-user tool - not worth a login flow, but shouldn't sit wide open
+// either. ALLOWED_IPS is a comma-separated Cloudflare secret; unset means
+// no restriction (fails open, not closed - a bad env config shouldn't lock
+// out the one person who uses this). Cloudflare's own edge sets
+// cf-connecting-ip, so this can't be spoofed by a client-supplied header.
+function ipAllowed(request, env) {
+  if (!env.ALLOWED_IPS) return true;
+  const ip = request.headers.get("cf-connecting-ip");
+  const allowed = env.ALLOWED_IPS.split(",").map((s) => s.trim()).filter(Boolean);
+  return allowed.includes(ip);
+}
+
 export default {
   async fetch(request, env) {
+    if (!ipAllowed(request, env)) {
+      return new Response("Forbidden", { status: 403 });
+    }
     const url = new URL(request.url);
     if (url.pathname.startsWith("/data/")) return readData(request, env);
     if (url.pathname === "/api/ledger") return handleLedger(request, env, null);
