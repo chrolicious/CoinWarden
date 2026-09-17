@@ -1,0 +1,8 @@
+## Interface: 120100
+## Title: CoinWarden
+## Notes: Logs gold and auction activity for the CoinWarden gold-flipping tool. No network access - a companion app syncs the SavedVariables file to the CoinWarden dashboard.
+## Author: chrolicious
+## Version: 0.1.0
+## SavedVariables: CoinWardenDB
+
+Core.lua

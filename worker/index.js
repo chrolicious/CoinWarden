@@ -2,6 +2,9 @@ const ALLOWED_PREFIXES = ["latest/", "history/", "items.json", "bonuses.json"];
 const LEDGER_KEY = "ledger/trades.json";
 const NETWORTH_KEY = "ledger/networth.json";
 const MAX_TRADES = 20000; // sanity cap, not a realistic ceiling for personal use
+const GAME_STATE_KEY = "game/state.json";
+const GAME_EVENTS_KEY = "game/events.json";
+const MAX_GAME_EVENTS = 50000; // ~months of AH activity at this account's volume
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -171,6 +174,95 @@ async function handleNetworth(request, env) {
   return json({ error: "method not allowed" }, 405);
 }
 
+// Addon-sourced game state: per-character gold + currently-listed auctions,
+// pushed by the local sync script (addons can't make HTTP calls themselves).
+async function handleGameState(request, env) {
+  if (request.method === "GET") {
+    const { data } = await getJsonObject(env, GAME_STATE_KEY, { characters: {} });
+    return json(data);
+  }
+
+  if (!requireToken(request, env)) {
+    return json({ error: "unauthorized" }, 401);
+  }
+
+  if (request.method === "PUT") {
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return json({ error: "invalid json" }, 400);
+    }
+    if (!body.character) return json({ error: "missing field: character" }, 400);
+    const result = await withJsonObject(env, GAME_STATE_KEY, { characters: {} }, (data) => {
+      data.characters = data.characters || {};
+      data.characters[body.character] = {
+        realm: body.realm || null,
+        class: body.class || null,
+        gold: Number.isFinite(Number(body.gold)) ? Math.round(Number(body.gold)) : null,
+        gold_updated_at: body.gold_updated_at || null,
+        auctions: body.auctions || {},
+        auctions_updated_at: body.auctions_updated_at || null,
+        synced_at: new Date().toISOString(),
+      };
+      return data.characters[body.character];
+    });
+    return json(result);
+  }
+
+  return json({ error: "method not allowed" }, 405);
+}
+
+// Addon-sourced buy/sell events (from AH mail invoices - see addon/CoinWarden).
+// Dedup key mirrors the addon's own per-mail dedup so a re-synced overlap
+// (sync script re-reading events it already sent) never double-counts.
+function eventKey(e) {
+  return [e.character, e.ts, e.type, e.item_name, e.price_copper, e.quantity].join("|");
+}
+
+async function handleGameEvents(request, env) {
+  const url = new URL(request.url);
+  if (request.method === "GET") {
+    const { data } = await getJsonObject(env, GAME_EVENTS_KEY, { events: [] });
+    const since = Number(url.searchParams.get("since") || 0);
+    const events = since ? data.events.filter((e) => e.ts > since) : data.events;
+    return json({ events });
+  }
+
+  if (!requireToken(request, env)) {
+    return json({ error: "unauthorized" }, 401);
+  }
+
+  if (request.method === "POST") {
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return json({ error: "invalid json" }, 400);
+    }
+    const incoming = Array.isArray(body.events) ? body.events : [];
+    const result = await withJsonObject(env, GAME_EVENTS_KEY, { events: [] }, (data) => {
+      const seen = new Set(data.events.map(eventKey));
+      let added = 0;
+      for (const e of incoming) {
+        if (!e.character || !e.ts || !e.type) continue;
+        const key = eventKey(e);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        data.events.push(e);
+        added++;
+      }
+      data.events.sort((a, b) => a.ts - b.ts);
+      const overflow = data.events.length - MAX_GAME_EVENTS;
+      if (overflow > 0) data.events.splice(0, overflow);
+      return { added, total: data.events.length };
+    });
+    return json(result);
+  }
+
+  return json({ error: "method not allowed" }, 405);
+}
+
 // GitHub's own schedule: triggers can be delayed for hours platform-wide
 // under load - all of them share one queue, so more cron slots inside the
 // workflow don't help (confirmed live: a 6-slot hedge still saw a 5h25m
@@ -204,6 +296,8 @@ export default {
     const m = url.pathname.match(/^\/api\/ledger\/([^/]+)$/);
     if (m) return handleLedger(request, env, decodeURIComponent(m[1]));
     if (url.pathname === "/api/networth") return handleNetworth(request, env);
+    if (url.pathname === "/api/game/state") return handleGameState(request, env);
+    if (url.pathname === "/api/game/events") return handleGameEvents(request, env);
     return env.ASSETS.fetch(request);
   },
   async scheduled(event, env, ctx) {
