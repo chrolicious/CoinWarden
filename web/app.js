@@ -20,7 +20,7 @@ const state = {
   generatedAt: null,
   favorites: new Set(loadFavorites()),
   filters: Object.assign({
-    maxBuy: 100000, minProfit: 100, minScore: 0, minSoldEvidence: 1,
+    minBuy: 0, maxBuy: 100000, minProfit: 100, minScore: 0, minSoldEvidence: 1,
     quality: "", itemClass: "", itemSubclass: "", slot: "", search: "", namedOnly: false,
   }, loadJSON("cw.filters", {})),
   sort: { spreads: ["score_per_day", -1], timing: ["score_per_day", -1], favorites: ["name", 1] },
@@ -30,8 +30,10 @@ const state = {
   trades: null,
   networth: null,
   gameEvents: null,
+  gameState: null,
+  progressShowChars: false,
   ledgerForm: Object.assign({ character: "", realm: REALM_ORDER[0], action: "buy", itemQuery: "",
-    selectedItem: null, variant: "", price: "", quantity: 1, notes: "" }, loadJSON("cw.ledgerFormDefaults", {})),
+    selectedItem: null, variant: "", price: "", quantity: 1, fees: "", notes: "" }, loadJSON("cw.ledgerFormDefaults", {})),
 };
 
 // ---------- utils ----------
@@ -184,6 +186,12 @@ async function loadNetworth() {
   if (!r.ok) throw new Error(`networth: ${r.status}`);
   state.networth = await r.json();
 }
+async function loadGameState() {
+  const r = await fetch("api/game/state", { cache: "no-cache" });
+  if (!r.ok) throw new Error(`game state: ${r.status}`);
+  const data = await r.json();
+  state.gameState = data.characters || {};
+}
 async function loadGameEvents() {
   const r = await fetch("api/game/events", { cache: "no-cache" });
   if (!r.ok) throw new Error(`game events: ${r.status}`);
@@ -228,6 +236,7 @@ function applyFilters(rows, kind) {
     if (f.itemClass && info.itemClass !== f.itemClass) return false;
     if (f.itemSubclass && info.itemSubclass !== f.itemSubclass) return false;
     if (f.slot && info.slot !== f.slot) return false;
+    if (r.buy_price < f.minBuy * COPPER) return false;
     if (r.buy_price > f.maxBuy * COPPER) return false;
     if (r.net_profit < f.minProfit * COPPER) return false;
     if (r.score_per_day < f.minScore * COPPER) return false;
@@ -272,6 +281,7 @@ function filterBar(kind, source) {
     select("Subtype", "itemSubclass", subclasses),
     select("Slot", "slot", slots, slotLabel),
     select("Quality", "quality", QUALITY_ORDER.filter((q) => infos.some((i) => i.quality === q)), cap),
+    num("Min buy (g)", "minBuy", { step: 1000 }),
     num("Max buy (g)", "maxBuy", { step: 1000 }),
     num("Min net profit (g)", "minProfit", { step: 100 }),
     num("Min profit/day (g)", "minScore", { step: 10 }),
@@ -331,7 +341,7 @@ function soldCell(r, showRealm) {
   // column, so it's omitted there instead of rendering "ask NaN".
   const askPart = showRealm ? ` · ask ${gold(r.current_ask)} x${r.sell_listings}` : "";
   return el("td", {},
-    el("div", {}, `Sold @ ${goldFull(r.sold_median_7d)}`),
+    el("div", {}, showRealm ? `List @ ${goldFull(r.target_sell_price ?? r.sold_median_7d)}` : `Sold @ ${goldFull(r.sold_median_7d)}`),
     showRealm ? el("div", { class: "realm" }, `on ${cap(r.sell_realm)}`) : null,
     el("div", { class: "realm" }, `${r.sold_7d}× in 7d${askPart}`));
 }
@@ -347,7 +357,7 @@ const SPREAD_COLS = [
   { key: "name", label: "Item", left: true, defaultDir: 1, cell: (r) => itemCell(r) },
   { key: "buy_price", label: "Buy", hint: "Cheapest current listing on the buy realm - the price you'd pay now.",
     cell: (r) => realmCell(r.buy_realm, r.buy_price, r.buy_listings) },
-  { key: "sold_median_7d", label: "Sell on", hint: "The realm and price this exact variant actually sold for (median of the last 7 days), not the current asking price. The × count is how many confirmed sales back that number.",
+  { key: "target_sell_price", label: "List on", hint: "Current executable target: one copper below the destination's cheapest listing, capped by the inferred 7-day sale median. The × count is the sale evidence behind that cap.",
     cell: (r) => soldCell(r, true) },
   { key: "score_per_day", label: "Expected Profit / Day", hint: "Expected value per day your buy gold is tied up: (probability it sells within 48h × net profit) minus (probability it doesn't × deposit loss), divided by expected days-to-sell. “Expected” means probability-weighted, not a guess. This is what the list is sorted by.",
     cell: evDayCell },
@@ -540,15 +550,17 @@ function renderLedgerForm(app) {
       if (!f.selectedItem) { errBox.textContent = "Pick an item from the search results."; return; }
       const price = Number(f.price);
       const qty = Number(f.quantity);
+      const fees = Number(f.fees || 0);
       if (!(price > 0)) { errBox.textContent = "Price must be a positive number of gold."; return; }
       if (!(qty >= 1)) { errBox.textContent = "Quantity must be at least 1."; return; }
+      if (!Number.isFinite(fees) || fees < 0) { errBox.textContent = "Fees must be a non-negative number."; return; }
       try {
         await submitTrade({
           character: f.character.trim(), realm: f.realm, action: f.action,
           item_id: f.selectedItem.item_id, item_name: f.selectedItem.name, variant: f.variant.trim(),
-          unit_price: Math.round(price * COPPER), quantity: Math.round(qty), notes: f.notes.trim(),
+          unit_price: Math.round(price * COPPER), quantity: Math.round(qty), fees: Math.round(fees * COPPER), notes: f.notes.trim(),
         });
-        f.selectedItem = null; f.itemQuery = ""; f.variant = ""; f.price = ""; f.quantity = 1; f.notes = "";
+        f.selectedItem = null; f.itemQuery = ""; f.variant = ""; f.price = ""; f.quantity = 1; f.fees = ""; f.notes = "";
         persist();
         await loadTrades();
         render();
@@ -574,6 +586,8 @@ function renderLedgerForm(app) {
         oninput: (e) => setField("price", e.target.value) })),
       el("label", {}, "Quantity", el("input", { type: "number", min: 1, step: 1, required: "", value: f.quantity, "data-fkey": "ledger-quantity",
         oninput: (e) => setField("quantity", e.target.value) })),
+      el("label", {}, "Fees total (g)", el("input", { type: "number", min: 0, step: "0.01", value: f.fees, placeholder: "AH cut + deposits", "data-fkey": "ledger-fees",
+        oninput: (e) => setField("fees", e.target.value) })),
     ),
     el("label", { class: "notes" }, "Notes (optional)", el("input", { type: "text", value: f.notes, maxlength: 256, "data-fkey": "ledger-notes",
       oninput: (e) => setField("notes", e.target.value) })),
@@ -600,6 +614,7 @@ function renderLedgerTable(app) {
     el("td", {}, goldFull(t.unit_price)),
     el("td", {}, t.quantity),
     el("td", {}, goldFull(t.unit_price * t.quantity)),
+    el("td", {}, t.fees ? goldFull(t.fees) : "—"),
     el("td", { class: "left" }, t.notes),
     el("td", {}, el("button", {
       class: "star", title: "Delete",
@@ -614,7 +629,7 @@ function renderLedgerTable(app) {
     el("thead", {}, el("tr", {},
       el("th", { class: "left" }, "Time"), el("th", { class: "left" }, "Character"), el("th", { class: "left" }, "Realm"),
       el("th", { class: "left" }, "Action"), el("th", { class: "left" }, "Item"), el("th", {}, "Unit"),
-      el("th", {}, "Qty"), el("th", {}, "Total"), el("th", { class: "left" }, "Notes"), el("th", {}, ""))),
+      el("th", {}, "Qty"), el("th", {}, "Total"), el("th", {}, "Fees"), el("th", { class: "left" }, "Notes"), el("th", {}, ""))),
     el("tbody", {}, ...rows))));
 }
 
@@ -671,14 +686,16 @@ function computeLedger(trades) {
     while (remaining > 0 && queue.length) {
       const lot = queue[0];
       const take = Math.min(lot.qty, remaining);
-      profit += (t.unit_price - lot.unit_price) * take;
+      // Sale price is gross; fees include AH cut and any lost deposits recorded
+      // for this logged sale. Allocate them across partial FIFO matches.
+      profit += (t.unit_price - lot.unit_price) * take - (t.fees || 0) * take / t.quantity;
       costBasisQty += take;
       lot.qty -= take;
       remaining -= take;
       if (lot.qty <= 0) queue.shift();
     }
     if (remaining > 0) {
-      profit += t.unit_price * remaining;
+      profit += t.unit_price * remaining - (t.fees || 0) * remaining / t.quantity;
       flagged.push({ trade: t, unmatchedQty: remaining });
     }
     if (!realized.has(k)) realized.set(k, { profit: 0, soldQty: 0, costBasisQty: 0, unmatchedQty: 0 });
@@ -708,10 +725,13 @@ function computeLedger(trades) {
 function estimateLiveValue(item_id, variant) {
   let best = null;
   for (const r of state.spreads) {
-    if (r.item_id === item_id && (r.variant || "") === variant) best = Math.max(best ?? 0, r.sold_median_7d ?? 0, r.current_ask ?? 0);
+    if (r.item_id === item_id && (r.variant || "") === variant) {
+      const target = r.target_sell_price ?? r.sold_median_7d;
+      best = Math.max(best ?? 0, Math.floor(target * 0.95));
+    }
   }
   for (const r of state.timing) {
-    if (r.item_id === item_id && (r.variant || "") === variant) best = Math.max(best ?? 0, r.sold_median_7d ?? 0, r.p50 ?? 0);
+    if (r.item_id === item_id && (r.variant || "") === variant) best = Math.max(best ?? 0, Math.floor(r.sold_median_7d * 0.95));
   }
   return best;
 }
@@ -726,14 +746,26 @@ function computeGoalSummary() {
     if (live != null) { totalLiveValue += live * p.qty; positionsWithLivePrice++; }
     return { ...p, live };
   }).sort((a, b) => b.totalCost - a.totalCost);
-  const liquidGold = (state.networth && state.networth.liquid_gold) || 0;
-  const holdingsValue = totalLiveValue || totalCostBasis; // fall back to cost basis when nothing has a live price
+  // Prefer the addon's actual reported gold (summed across every tracked
+  // character, plus the account-wide warband balance counted once - it's
+  // the same number on every character, not per-character money) over the
+  // old manual-entry field. Manual entry stays as a fallback for before the
+  // addon existed or if sync ever lapses.
+  const chars = Object.values(state.gameState || {});
+  const characterGold = chars.reduce((s, c) => s + (c.gold || 0), 0);
+  const newestWarband = chars.filter((c) => c.warband_gold_updated_at)
+    .sort((a, b) => String(b.warband_gold_updated_at).localeCompare(String(a.warband_gold_updated_at)))[0];
+  const warbandGold = newestWarband?.warband_gold || 0;
+  const addonLiquidGold = characterGold + warbandGold;
+  const manualLiquidGold = (state.networth && state.networth.liquid_gold) || 0;
+  const liquidGold = chars.length ? addonLiquidGold : manualLiquidGold;
+  const holdingsValue = positionRows.reduce((sum, p) => sum + (p.live ?? p.totalCost / p.qty) * p.qty, 0);
   const netWorth = liquidGold + holdingsValue;
   const goalCopper = GOAL_GOLD * COPPER;
   const progress = Math.min(1, netWorth / goalCopper);
   const totalRealized = realized.reduce((s, r) => s + r.profit, 0);
   return { positions: positionRows, realized, flagged, totalCostBasis, totalLiveValue, positionsWithLivePrice,
-    liquidGold, holdingsValue, netWorth, goalCopper, progress, totalRealized };
+    liquidGold, addonLiquidGold, characterGold, warbandGold, holdingsValue, netWorth, goalCopper, progress, totalRealized };
 }
 
 // Cumulative gold made/spent, all characters combined and per-character,
@@ -752,13 +784,17 @@ function computeMonthlyProgress(events) {
     const t = e.ts * 1000;
     totalCum += e.delta;
     totalPts.push({ t, v: totalCum / COPPER });
-    const c = byChar.get(e.character) || { cum: 0, pts: [{ t: startT, v: 0 }] };
+    // Each character's own baseline is its own first event, not the global
+    // startT - anchoring every character to the same shared zero-point
+    // drew long diagonal lines from whichever character acted first to
+    // wherever a later-starting character's real data began.
+    const c = byChar.get(e.character) || { cum: 0, pts: [{ t, v: 0 }] };
     c.cum += e.delta;
     c.pts.push({ t, v: c.cum / COPPER });
     byChar.set(e.character, c);
   }
   const monthMs = 30 * 86400000;
-  const targetEnd = (MONTHLY_TARGET_GOLD * (endT - startT)) / monthMs / COPPER;
+  const targetEnd = (MONTHLY_TARGET_GOLD * (endT - startT)) / monthMs;
   const colors = ["var(--s2)", "var(--s3)", "var(--s4)", "var(--s5)", "var(--accent)"];
   const charSeries = [...byChar.entries()].map(([name, c], i) => ({
     realm: name, color: colors[i % colors.length], points: c.pts,
@@ -779,9 +815,20 @@ function progressCard() {
     card.append(el("div", { class: "chart-empty" }, "No tracked activity yet - the addon needs a bit of play time before this fills in."));
     return card;
   }
-  const legend = el("div", { class: "legend" }, ...progress.series.map((s) =>
+  // Total + Target only by default - with a dozen-plus characters tracked,
+  // showing every line at once is unreadable. Toggle reveals the rest.
+  const shown = state.progressShowChars
+    ? progress.series
+    : progress.series.filter((s) => s.realm === "Total (all characters)" || s.realm === "Target pace");
+  const toggle = progress.series.length > 2
+    ? el("label", { class: "check" },
+        el("input", { type: "checkbox", checked: state.progressShowChars ? "" : null,
+          onchange: (e) => { state.progressShowChars = e.target.checked; render(); } }),
+        `show ${progress.series.length - 2} characters individually`)
+    : null;
+  const legend = el("div", { class: "legend" }, ...shown.map((s) =>
     el("span", { style: `color:${s.color}` }, el("span", { class: "key" }), el("span", { style: "color:var(--ink-2)" }, s.realm))));
-  card.append(legend, lineChart(progress.series));
+  card.append(el("div", { class: "chart-controls" }, toggle, legend), lineChart(shown, { allowNegative: true }));
   return card;
 }
 
@@ -794,10 +841,12 @@ function goalCard(g) {
     ),
     el("div", { class: "goal-bar" }, el("div", { class: "goal-fill", style: `width:${(g.progress * 100).toFixed(1)}%` })),
     el("div", { class: "count" },
-      `${goldFull(g.liquidGold)} liquid${state.networth?.updated_at ? ` (updated ${ago(state.networth.updated_at)})` : " (not set)"} `
+      g.addonLiquidGold
+        ? `${goldFull(g.liquidGold)} liquid (${goldFull(g.characterGold)} across characters + ${goldFull(g.warbandGold)} warband, from the addon) `
+        : `${goldFull(g.liquidGold)} liquid${state.networth?.updated_at ? ` (updated ${ago(state.networth.updated_at)}, manual)` : " (not set)"} `
       + `+ ${goldFull(g.holdingsValue)} in holdings ${g.totalLiveValue ? `(${g.positionsWithLivePrice}/${g.positions.length} at live price, rest at cost)` : "(cost basis - no live prices found)"}`),
     el("div", { class: "count" },
-      `Pace: ${goldFull(MONTHLY_TARGET_GOLD)}/month for ${GOAL_MONTHS} months to hit the goal `
+      `Pace: ${goldFull(MONTHLY_TARGET_GOLD * COPPER)}/month for ${GOAL_MONTHS} months to hit the goal `
       + `- linear target, doesn't account for growth compounding as capital increases.`));
 }
 
@@ -879,7 +928,7 @@ function renderHoldings(app) {
 function highlightRow(r, kind) {
   const info = itemInfo(r.item_id, r);
   const sellLine = kind === "spread"
-    ? `Buy ${cap(r.buy_realm)} ${goldFull(r.buy_price)} → sell ${cap(r.sell_realm)} @ ${goldFull(r.sold_median_7d)}`
+    ? `Buy ${cap(r.buy_realm)} ${goldFull(r.buy_price)} → list ${cap(r.sell_realm)} @ ${goldFull(r.target_sell_price ?? r.sold_median_7d)}`
     : `${cap(r.realm_slug)}: now ${goldFull(r.buy_price)}, normally ${goldFull(r.p50)} (${pct(r.discount)} below)`;
   return el("div", { class: "hl-row", onclick: () => openDetail(rowKey(r)) },
     info.icon ? whLink(r.item_id, r.variant, el("img", { src: info.icon, alt: "", loading: "lazy" })) : null,
@@ -902,8 +951,8 @@ function renderDashboard(app) {
   app.append(el("h3", { class: "section-h" }, "Progress this run"));
   app.append(progressCard());
 
-  const topSpreads = sortRows(state.spreads, ["score_per_day", -1]).slice(0, 5);
-  const topTiming = sortRows(state.timing, ["score_per_day", -1]).slice(0, 5);
+  const topSpreads = sortRows(applyFilters(state.spreads, "spreads"), ["score_per_day", -1]).slice(0, 5);
+  const topTiming = sortRows(applyFilters(state.timing, "timing"), ["score_per_day", -1]).slice(0, 5);
   app.append(el("div", { class: "dash-cols" },
     el("div", {},
       el("h3", { class: "section-h" }, "Top cross-realm flips right now"),
@@ -982,7 +1031,7 @@ function chartCard(history) {
       const t = new Date(`${d.day}T12:00:00Z`).getTime();
       if (t < hourlyStart) pts.push({ t, v: (c.measure === "min" ? d.typical_price : d.median_price) / COPPER, n: Math.round(d.avg_listing_count), daily: true });
     }
-    return { realm, color: REALM_COLOR[realm], points: pts.filter((p) => p.t >= cutoff).sort((a, b) => a.t - b.t) };
+    return { realm: cap(realm), color: REALM_COLOR[realm], points: pts.filter((p) => p.t >= cutoff).sort((a, b) => a.t - b.t) };
   }).filter((s) => s.points.length);
 
   if (!series.length) { card.append(el("div", { class: "chart-empty" }, "No data in this range.")); return card; }
@@ -1000,12 +1049,16 @@ function chartCard(history) {
   return card;
 }
 
-function lineChart(series) {
+function lineChart(series, { allowNegative = false } = {}) {
   const W = 1000, H = 280, P = { l: 64, r: 16, t: 12, b: 28 };
   const all = series.flatMap((s) => s.points);
   const tMin = Math.min(...all.map((p) => p.t)), tMax = Math.max(...all.map((p) => p.t));
   const vMax = Math.max(...all.map((p) => p.v)), vMinRaw = Math.min(...all.map((p) => p.v));
-  const vMin = Math.max(0, vMinRaw - (vMax - vMinRaw) * 0.1);
+  // Prices never go negative, so the floor is normally clamped to 0 - but
+  // cumulative income/expense totals legitimately can dip below zero (spent
+  // before earning), and clamping there just runs the line off the bottom
+  // of the visible chart instead of scaling to show it.
+  const vMin = allowNegative ? vMinRaw - (vMax - vMinRaw) * 0.1 : Math.max(0, vMinRaw - (vMax - vMinRaw) * 0.1);
   const vSpan = (vMax - vMin) || 1, tSpan = (tMax - tMin) || 1;
   const x = (t) => P.l + ((t - tMin) / tSpan) * (W - P.l - P.r);
   const y = (v) => P.t + (1 - (v - vMin) / vSpan) * (H - P.t - P.b);
@@ -1056,7 +1109,7 @@ function lineChart(series) {
     for (const s of series) {
       const p = s.points.find((q) => q.t === best);
       if (!p) continue;
-      tip.append(el("div", { class: "row" }, el("span", {}, el("span", { class: "key", style: `background:${s.color}` }), cap(s.realm)), el("b", {}, `${goldFull(p.v * COPPER)} · ${p.n}`)));
+      tip.append(el("div", { class: "row" }, el("span", {}, el("span", { class: "key", style: `background:${s.color}` }), s.realm), el("b", {}, p.n !== undefined ? `${goldFull(p.v * COPPER)} · ${p.n}` : goldFull(p.v * COPPER))));
     }
     tip.style.display = "block";
     const left = (x(best) / W) * rect.width;
@@ -1121,6 +1174,10 @@ function route() {
   if (state.tab === "dashboard" && state.gameEvents === null) {
     state.gameEvents = []; // avoid re-triggering while the fetch is in flight
     loadGameEvents().then(render).catch((e) => { state.gameEvents = null; console.error(e); });
+  }
+  if ((state.tab === "holdings" || state.tab === "dashboard") && state.gameState === null) {
+    state.gameState = {}; // avoid re-triggering while the fetch is in flight
+    loadGameState().then(render).catch((e) => { state.gameState = null; console.error(e); });
   }
   state.detail = null;
   render();

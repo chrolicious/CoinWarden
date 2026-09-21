@@ -102,14 +102,22 @@ def push_state(character: str, char_data: dict) -> None:
     print(f"  state: gold={body['gold']}, warband={body['warband_gold']}, {len(auctions)} owned auctions")
 
 
-def push_events(character: str, events: list[dict], since_ts: int) -> int:
-    new_events = [e for e in events if e.get("ts", 0) > since_ts]
+def push_events(character: str, events: list[dict], cursor: int | dict) -> dict:
+    # Old cursors were timestamps. New addon events have a persistent sequence,
+    # so multiple events in one second cannot be skipped on the next sync.
+    if isinstance(cursor, dict):
+        last_id, last_ts = cursor.get("event_id", 0), cursor.get("ts", 0)
+        new_events = [e for e in events if e.get("event_id", 0) > last_id]
+    else:
+        last_id, last_ts = 0, cursor
+        new_events = [e for e in events if e.get("ts", 0) > last_ts]
     if not new_events:
-        print(f"  events: none new (cursor at {since_ts})")
-        return since_ts
+        print(f"  events: none new (cursor at {last_ts})")
+        return {"event_id": last_id, "ts": last_ts}
     payload = [
         {
             "character": character,
+            "event_id": e.get("event_id"),
             "ts": e["ts"],
             "type": e["type"],
             "item_name": e.get("item_name"),
@@ -128,7 +136,10 @@ def push_events(character: str, events: list[dict], since_ts: int) -> int:
     resp.raise_for_status()
     result = resp.json()
     print(f"  events: sent {len(payload)}, server added {result.get('added')} new (total {result.get('total')})")
-    return max(e["ts"] for e in new_events)
+    return {
+        "event_id": max((e.get("event_id", 0) for e in new_events), default=last_id),
+        "ts": max(e["ts"] for e in new_events),
+    }
 
 
 def main() -> None:
@@ -146,8 +157,7 @@ def main() -> None:
         print(f"{character}:")
         push_state(character, char_data)
         events = char_data.get("events") or []
-        since_ts = cursors.get(character, 0)
-        cursors[character] = push_events(character, events, since_ts)
+        cursors[character] = push_events(character, events, cursors.get(character, 0))
 
     _save_cursors(cursors)
     print("done")

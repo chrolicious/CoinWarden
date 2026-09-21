@@ -34,6 +34,8 @@ end
 
 local function pushEvent(kind, data)
     local char = ensureCharacter()
+    char.next_event_id = (char.next_event_id or 0) + 1
+    data.event_id = char.next_event_id
     data.type = kind
     data.ts = nowTS()
     table.insert(char.events, data)
@@ -51,13 +53,9 @@ local function snapshotGold()
     char.gold_updated_at = nowTS()
 end
 
--- Best-effort: Warband Bank gold isn't visible to GetMoney() (that's
--- character-only). C_Bank is the real namespace for the account-wide bank
--- added with Warband Bank, but the exact function name/args below aren't
--- verified against a live client - if this errors, snapshotWarbandGold
--- silently no-ops (caller wraps in pcall) rather than breaking the addon,
--- and the first /coinwarden dump after visiting the bank will show whether
--- it worked.
+-- Warband Bank gold isn't visible to GetMoney() (that's character-only).
+-- C_Bank.FetchDepositedMoney(Enum.BankType.Account) confirmed live
+-- 2026-09-17 - correct value read back on the first guess.
 local function snapshotWarbandGold()
     if not (C_Bank and C_Bank.FetchDepositedMoney and Enum.BankType) then
         return
@@ -135,6 +133,17 @@ local lastGold
 local pendingQuestReward = false
 local pendingRepair = false
 local auctionHouseOpen, mailOpen, merchantOpen, lootOpen = false, false, false, false
+-- A deposit/purchase charge can land a moment after the triggering frame's
+-- close event fires (confirmed live: an ~8000g AH deposit got tagged
+-- "other" because AUCTION_HOUSE_CLOSED had already flipped the flag off by
+-- the time the charge posted). Grace period keeps "just closed" counted as
+-- still open for categorization purposes.
+local CLOSE_GRACE_SECONDS = 5
+local auctionHouseClosedAt, mailClosedAt, merchantClosedAt
+
+local function recentlyOpen(isOpen, closedAt)
+    return isOpen or (closedAt and nowTS() - closedAt <= CLOSE_GRACE_SECONDS)
+end
 
 local function handleMoneyChange()
     local char = ensureCharacter()
@@ -154,9 +163,9 @@ local function handleMoneyChange()
         category = "quest_reward"
     elseif pendingRepair then
         category = "repair"
-    elseif auctionHouseOpen or mailOpen then
+    elseif recentlyOpen(auctionHouseOpen, auctionHouseClosedAt) or recentlyOpen(mailOpen, mailClosedAt) then
         category = "ah_related"
-    elseif merchantOpen then
+    elseif recentlyOpen(merchantOpen, merchantClosedAt) then
         category = delta > 0 and "vendor_sell" or "vendor_buy"
     elseif lootOpen then
         category = "loot"
@@ -213,6 +222,7 @@ f:SetScript("OnEvent", function(self, event, arg1, arg2, arg3)
         if not ok then pushEvent("_error", { context = "scanMailInvoices", err = tostring(err) }) end
     elseif event == "MAIL_CLOSED" then
         mailOpen = false
+        mailClosedAt = nowTS()
     elseif event == "AUCTION_HOUSE_SHOW" then
         auctionHouseOpen = true
         local ok, err = pcall(snapshotOwnedAuctions)
@@ -222,10 +232,12 @@ f:SetScript("OnEvent", function(self, event, arg1, arg2, arg3)
         if not ok then pushEvent("_error", { context = "snapshotOwnedAuctions", err = tostring(err) }) end
     elseif event == "AUCTION_HOUSE_CLOSED" then
         auctionHouseOpen = false
+        auctionHouseClosedAt = nowTS()
     elseif event == "MERCHANT_SHOW" then
         merchantOpen = true
     elseif event == "MERCHANT_CLOSED" then
         merchantOpen = false
+        merchantClosedAt = nowTS()
     elseif event == "LOOT_OPENED" then
         lootOpen = true
     elseif event == "LOOT_CLOSED" then

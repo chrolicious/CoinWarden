@@ -3,7 +3,7 @@ import sqlite3
 import time
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS item_price_snapshots (
@@ -105,6 +105,7 @@ CREATE TABLE IF NOT EXISTS recommendation_log (
     buy_price INTEGER NOT NULL,
     sell_realm TEXT NOT NULL,
     sold_median_7d INTEGER,
+    target_sell_price INTEGER,
     net_profit INTEGER NOT NULL,
     score_per_day INTEGER NOT NULL,
     p_sold_48h REAL NOT NULL,
@@ -164,6 +165,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
             FROM item_price_snapshots_v1
         """)
         conn.execute("DROP TABLE item_price_snapshots_v1")
+    if version < 3 and _table_exists(conn, "recommendation_log") and not _column_exists(conn, "recommendation_log", "target_sell_price"):
+        conn.execute("ALTER TABLE recommendation_log ADD COLUMN target_sell_price INTEGER")
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
 
@@ -224,7 +227,7 @@ ranked AS (
            COUNT(*) OVER (PARTITION BY connected_realm_id, item_id, variant, day) AS n
     FROM hourly
 )
-INSERT OR REPLACE INTO daily_item_prices
+INSERT OR IGNORE INTO daily_item_prices
     (realm_slug, connected_realm_id, item_id, variant, day, low_price, typical_price, high_price,
      median_price, avg_listing_count, turnover_events, snapshots)
 SELECT realm_slug, connected_realm_id, item_id, variant, day,

@@ -49,8 +49,10 @@ async function getJsonObject(env, key, fallback) {
 
 async function putJsonObject(env, key, data, etag) {
   const opts = { httpMetadata: { contentType: "application/json" } };
-  if (etag) opts.onlyIf = { etagMatches: etag };
-  return env.DATA.put(key, JSON.stringify(data), opts);
+  opts.onlyIf = etag ? { etagMatches: etag } : { etagDoesNotMatch: "*" };
+  const object = await env.DATA.put(key, JSON.stringify(data), opts);
+  if (object === null) throw new Error("conditional R2 write conflict");
+  return object;
 }
 
 // Read-modify-write with a conditional put so a rare concurrent write (e.g.
@@ -112,9 +114,10 @@ async function handleLedger(request, env, id) {
       action: body.action,
       unit_price: Math.round(Number(body.unit_price)),
       quantity: Math.max(1, Math.round(Number(body.quantity))),
+      fees: Math.max(0, Math.round(Number(body.fees || 0))),
       notes: String(body.notes || "").slice(0, 256),
     };
-    if (!Number.isFinite(trade.item_id) || !Number.isFinite(trade.unit_price) || trade.unit_price < 0) {
+    if (!Number.isFinite(trade.item_id) || !Number.isFinite(trade.unit_price) || trade.unit_price < 0 || !Number.isFinite(trade.fees)) {
       return json({ error: "invalid numeric field" }, 400);
     }
     const result = await withJsonObject(env, LEDGER_KEY, { trades: [] }, (data) => {
@@ -219,6 +222,7 @@ async function handleGameState(request, env) {
 // Dedup key mirrors the addon's own per-mail dedup so a re-synced overlap
 // (sync script re-reading events it already sent) never double-counts.
 function eventKey(e) {
+  if (e.event_id != null) return [e.character, e.event_id].join("|");
   return [e.character, e.ts, e.type, e.item_name, e.price_copper, e.quantity, e.delta, e.category].join("|");
 }
 

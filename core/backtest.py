@@ -31,7 +31,7 @@ def log(conn: sqlite3.Connection, spreads: list[dict], timing: list[dict], fetch
             rows.append((
                 fetched_at, kind, r["item_id"], r["variant"], rank,
                 r["buy_realm"] if kind == "spread" else r["realm_slug"], r["buy_price"], sell_realm,
-                r["sold_median_7d"], r["net_profit"], int(r["score_per_day"]), r["p_sold_48h"], r["days_to_sell"],
+                r["sold_median_7d"], r["target_sell_price"], r["net_profit"], int(r["score_per_day"]), r["p_sold_48h"], r["days_to_sell"],
             ))
     if not rows:
         return 0
@@ -39,8 +39,8 @@ def log(conn: sqlite3.Connection, spreads: list[dict], timing: list[dict], fetch
         conn.executemany(
             "INSERT OR REPLACE INTO recommendation_log "
             "(fetched_at, kind, item_id, variant, rank, buy_realm, buy_price, sell_realm, "
-            " sold_median_7d, net_profit, score_per_day, p_sold_48h, days_to_sell) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " sold_median_7d, target_sell_price, net_profit, score_per_day, p_sold_48h, days_to_sell) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             rows,
         )
     return len(rows)
@@ -49,7 +49,8 @@ def log(conn: sqlite3.Connection, spreads: list[dict], timing: list[dict], fetch
 EVALUATE_SQL = """
 WITH candidates AS (
     SELECT * FROM recommendation_log
-    WHERE fetched_at >= ? AND fetched_at <= ?
+WHERE fetched_at >= ? AND fetched_at <= ?
+  AND target_sell_price IS NOT NULL
 ),
 buy_check AS (
     SELECT c.fetched_at, c.kind, c.item_id, c.variant,
@@ -64,7 +65,7 @@ buy_check AS (
 sell_check AS (
     SELECT c.fetched_at, c.kind, c.item_id, c.variant,
            MIN(e.vanished_at) AS first_sold_at,
-           MIN(e.unit_price) AS first_sold_price
+           MAX(e.unit_price) AS best_sold_price
     FROM candidates c
     JOIN sale_events e
       ON e.realm_slug = c.sell_realm AND e.item_id = c.item_id AND e.variant = c.variant AND e.kind = 'sold'
@@ -72,7 +73,7 @@ sell_check AS (
      AND julianday(e.vanished_at) <= julianday(c.fetched_at) + ?
     GROUP BY c.fetched_at, c.kind, c.item_id, c.variant
 )
-SELECT c.*, b.next_min_price, sc.first_sold_at, sc.first_sold_price
+SELECT c.*, b.next_min_price, sc.first_sold_at, sc.best_sold_price
 FROM candidates c
 LEFT JOIN buy_check b ON b.fetched_at = c.fetched_at AND b.kind = c.kind AND b.item_id = c.item_id AND b.variant = c.variant
 LEFT JOIN sell_check sc ON sc.fetched_at = c.fetched_at AND sc.kind = c.kind AND sc.item_id = c.item_id AND sc.variant = c.variant
@@ -92,7 +93,8 @@ def evaluate(conn: sqlite3.Connection, min_age_hours: float, sell_horizon_days: 
     rows = [dict(zip(cols, row)) for row in cur.fetchall()]
     for r in rows:
         r["buy_achieved"] = r["next_min_price"] is not None and r["next_min_price"] <= r["buy_price"] * BUY_PRICE_TOLERANCE
-        r["sold_within_horizon"] = r["first_sold_at"] is not None
+        r["sold_within_horizon"] = (r["target_sell_price"] is not None and r["best_sold_price"] is not None
+                                    and r["best_sold_price"] >= r["target_sell_price"])
     return rows
 
 
@@ -108,7 +110,8 @@ def summarize(rows: list[dict]) -> dict:
     sold_n, sold_rate = rate(lambda r: r["sold_within_horizon"])
     both_n, both_rate = rate(lambda r: r["buy_achieved"] and r["sold_within_horizon"])
 
-    realized = [r["net_profit"] for r in rows if r["buy_achieved"] and r["sold_within_horizon"]]
+    realized = [int(r["best_sold_price"] * 0.95) - r["buy_price"]
+                for r in rows if r["buy_achieved"] and r["sold_within_horizon"]]
 
     # Calibration: predicted P(sold within 48h) vs actual, bucketed by decile.
     buckets: dict[int, list[dict]] = {}
@@ -160,7 +163,7 @@ def main():
             continue
         print(f"buy achievable next hour: {summary['buy_achieved']['n']}/{summary['n']} "
               f"({summary['buy_achieved']['rate']:.0%})")
-        print(f"sold within {args.sell_horizon_days:.0f}d: {summary['sold_within_horizon']['n']}/{summary['n']} "
+        print(f"sold at or above target within {args.sell_horizon_days:.0f}d: {summary['sold_within_horizon']['n']}/{summary['n']} "
               f"({summary['sold_within_horizon']['rate']:.0%})")
         print(f"both (a real, actionable flip): {summary['both']['n']}/{summary['n']} "
               f"({summary['both']['rate']:.0%})")

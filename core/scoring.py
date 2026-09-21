@@ -59,14 +59,29 @@ def ensure_latest_snapshot(conn: sqlite3.Connection) -> None:
 
         DROP TABLE IF EXISTS temp.sales_7d;
         CREATE TEMP TABLE sales_7d AS
-            SELECT connected_realm_id, item_id, variant,
-                   SUM(sold_count) AS sold_7d,
-                   SUM(relist_count) AS relist_7d,
-                   SUM(expired_count) AS expired_7d,
-                   MAX(sold_median_price) AS sold_median_7d
-            FROM daily_sales
-            WHERE day >= '{window_start}'
-            GROUP BY connected_realm_id, item_id, variant;
+            WITH ev AS (
+                SELECT connected_realm_id, item_id, variant, unit_price, kind
+                FROM sale_events
+                WHERE vanished_at >= '{window_start}'
+            ),
+            sold_ranked AS (
+                SELECT *, ROW_NUMBER() OVER (PARTITION BY connected_realm_id, item_id, variant ORDER BY unit_price) AS rn,
+                       COUNT(*) OVER (PARTITION BY connected_realm_id, item_id, variant) AS n
+                FROM ev WHERE kind = 'sold'
+            ),
+            sold AS (
+                SELECT connected_realm_id, item_id, variant, COUNT(*) AS sold_7d,
+                       MAX(CASE WHEN rn = (n + 1) / 2 THEN unit_price END) AS sold_median_7d
+                FROM sold_ranked GROUP BY connected_realm_id, item_id, variant
+            ),
+            activity AS (
+                SELECT connected_realm_id, item_id, variant,
+                       SUM(kind = 'relist') AS relist_7d, SUM(kind = 'expired') AS expired_7d
+                FROM ev GROUP BY connected_realm_id, item_id, variant
+            )
+            SELECT sold.connected_realm_id, sold.item_id, sold.variant, sold.sold_7d, sold.sold_median_7d,
+                   COALESCE(activity.relist_7d, 0) AS relist_7d, COALESCE(activity.expired_7d, 0) AS expired_7d
+            FROM sold LEFT JOIN activity USING (connected_realm_id, item_id, variant);
         CREATE INDEX temp.idx_sales_7d ON sales_7d (connected_realm_id, item_id, variant);
     """)
 
@@ -107,10 +122,8 @@ LIMIT ?
 """
 
 # Cross-realm spread on the latest snapshot, per item variant. Buy at the
-# cheapest listing on the cheapest realm; sell on the other realm with the
-# best *actually realized* sold price (not the cheapest current ask - that's
-# a wish, not a transaction), gated on a minimum number of confirmed sales in
-# the last 7 days so zero-evidence variants never rank on a guess. The buy
+# cheapest listing on the cheapest realm; sell on another realm below its
+# current cheapest ask, capped by the 7-day inferred-sale median. The buy
 # price still needs to sit within a sane multiple of the cross-realm anchor
 # (median of the cheapest listing per realm) to filter obvious troll listings.
 # Params: min_sold_evidence, sanity_multiple, (RISK_SCORE_SQL_TAIL params)
@@ -138,33 +151,38 @@ buy AS (
 sell AS (
     SELECT l.item_id, l.variant, l.realm_slug AS sell_realm, l.min_unit_price AS current_ask,
            l.listing_count AS sell_listings,
-           s.sold_7d, s.sold_median_7d, s.relist_7d,
-           ROW_NUMBER() OVER (PARTITION BY l.item_id, l.variant ORDER BY s.sold_median_7d DESC) AS rn
+           s.sold_7d, s.sold_median_7d, s.relist_7d
     FROM latest l
     JOIN sales_7d s ON s.connected_realm_id = l.connected_realm_id AND s.item_id = l.item_id AND s.variant = l.variant
     WHERE s.sold_7d >= ?
 ),
-spread AS (
+spread_candidates AS (
     SELECT b.item_id, b.variant, b.buy_realm, b.buy_price, b.buy_listings,
            s.sell_realm, s.current_ask, s.sell_listings, s.sold_7d, s.sold_median_7d, s.relist_7d,
            a.anchor_price, a.realm_count,
-           CAST(s.sold_median_7d * (1 - {AH_CUT}) - b.buy_price AS INTEGER) AS net_profit
+           MIN(s.sold_median_7d, s.current_ask - 1) AS target_sell_price
     FROM buy b
     JOIN anchor a ON a.item_id = b.item_id AND a.variant = b.variant
-    JOIN sell s ON s.item_id = b.item_id AND s.variant = b.variant AND s.rn = 1
+    JOIN sell s ON s.item_id = b.item_id AND s.variant = b.variant
     WHERE b.rn = 1
       AND s.sell_realm != b.buy_realm
       AND s.sold_median_7d <= a.anchor_price * ?
+),
+spread AS (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY item_id, variant ORDER BY target_sell_price DESC, sell_listings ASC) AS rn
+    FROM spread_candidates
 ),
 priced AS (
     SELECT sp.item_id, sp.variant, i.name, i.quality, i.item_class, i.item_subclass,
            i.vendor_sell_price,
            sp.buy_realm, sp.buy_price, sp.buy_listings,
            sp.sell_realm, sp.current_ask, sp.sell_listings AS sell_listings,
-           sp.sold_7d AS sold_7d, sp.sold_median_7d, sp.relist_7d,
-           sp.anchor_price, sp.realm_count, sp.net_profit
+           sp.sold_7d AS sold_7d, sp.sold_median_7d, sp.target_sell_price, sp.relist_7d,
+           sp.anchor_price, sp.realm_count,
+           CAST(sp.target_sell_price * (1 - {AH_CUT}) - sp.buy_price AS INTEGER) AS net_profit
     FROM spread sp
     LEFT JOIN items i ON i.item_id = sp.item_id
+    WHERE sp.rn = 1
 ),
 {_risk_score_sql_tail(p_sold)}
 """
@@ -258,7 +276,7 @@ priced AS (
     SELECT d.item_id, d.variant, i.name, i.quality, i.item_class, i.item_subclass, i.vendor_sell_price,
            d.realm_slug, d.buy_price, d.listing_count AS sell_listings,
            d.p25, d.p50, d.p75, d.days, d.samples, d.source, d.turnover_events,
-           d.sold_7d, d.sold_median_7d, d.relist_7d, d.discount, d.zscore,
+           d.sold_7d, d.sold_median_7d, d.sold_median_7d AS target_sell_price, d.relist_7d, d.discount, d.zscore,
            CAST(d.sold_median_7d * (1 - {AH_CUT}) - d.buy_price AS INTEGER) AS net_profit
     FROM dip d
     LEFT JOIN items i ON i.item_id = d.item_id
@@ -397,7 +415,7 @@ def _print_spreads(rows: list[dict]) -> None:
           f"{'p(sold)':>7} {'deposit':>8} {'net':>9} {'EV/day':>8}")
     for r in rows:
         buy = f"{r['buy_realm'][:10]} {_gold(r['buy_price'])} x{r['buy_listings']}"
-        sell = f"{r['sell_realm'][:10]} sold@{_gold(r['sold_median_7d'])} x{r['sold_7d']}"
+        sell = f"{r['sell_realm'][:10]} list@{_gold(r['target_sell_price'])} x{r['sold_7d']}"
         print(f"{_label(r):<46} {buy:<24} {sell:<24} {r['sold_7d']:>6} {r['days_to_sell']:>6} "
               f"{r['p_sold_48h']:>7.0%} {_gold(int(r['deposit_estimate'])):>8} "
               f"{_gold(r['net_profit']):>9} {_gold(int(r['score_per_day'])):>8}")
