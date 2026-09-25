@@ -103,14 +103,19 @@ def push_state(character: str, char_data: dict) -> None:
 
 
 def push_events(character: str, events: list[dict], cursor: int | dict) -> dict:
-    # Old cursors were timestamps. New addon events have a persistent sequence,
-    # so multiple events in one second cannot be skipped on the next sync.
+    # Old cursors were timestamps. New addon events have a persistent
+    # sequence, so multiple events in one second cannot be skipped on the
+    # next sync. Straggler events written by a client that hadn't /reload-ed
+    # the event_id-aware addon yet have no event_id at all - those fall back
+    # to the ts comparison instead of being silently swallowed by `0 > 0`.
     if isinstance(cursor, dict):
         last_id, last_ts = cursor.get("event_id", 0), cursor.get("ts", 0)
-        new_events = [e for e in events if e.get("event_id", 0) > last_id]
     else:
         last_id, last_ts = 0, cursor
-        new_events = [e for e in events if e.get("ts", 0) > last_ts]
+    new_events = [
+        e for e in events
+        if (e["event_id"] > last_id if e.get("event_id") else e.get("ts", 0) > last_ts)
+    ]
     if not new_events:
         print(f"  events: none new (cursor at {last_ts})")
         return {"event_id": last_id, "ts": last_ts}

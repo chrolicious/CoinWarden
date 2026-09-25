@@ -107,10 +107,18 @@ local function scanMailInvoices()
             local key = table.concat({ v1, tostring(v2), tostring(v3), tostring(price), tostring(qty) }, "|")
             if not char.seenInvoices[key] then
                 char.seenInvoices[key] = nowTS()
+                -- The confirmed-live quantity slot (v5) held the actual
+                -- stack size for a bid-won stackable item, but a straight
+                -- buyout of a one-of-a-kind item (e.g. a Design) returned
+                -- the same value as price there instead - no real WoW AH
+                -- stack ever approaches that size, so treat anything above
+                -- the realistic max stack (1000) as "unknown, assume 1"
+                -- rather than trust a clearly bogus number.
+                local quantity = (type(qty) == "number" and qty > 0 and qty <= 1000) and qty or 1
                 pushEvent(v1 == "seller" and "sold" or "bought_via_mail", {
                     item_name = v2, counterparty = v3,
-                    price_copper = price, quantity = qty, deposit = deposit, ah_cut = ahCut,
-                    unclaimed_money = unclaimed, v8 = v8, v10 = v10,
+                    price_copper = price, quantity = quantity, quantity_raw = qty,
+                    deposit = deposit, ah_cut = ahCut, unclaimed_money = unclaimed, v8 = v8, v10 = v10,
                 })
             end
         end
